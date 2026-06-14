@@ -1,0 +1,22 @@
+# Finance-strategies files (belong in the other repo)
+etf_efficient_macd.py
+etf_global_macd.py
+etf_india_mtf_macd.py
+etf_leveraged_macd.py
+etf_sheet13_tracker.py
+strategy.py
+my_plot*.png
+
+# Claude settings
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
