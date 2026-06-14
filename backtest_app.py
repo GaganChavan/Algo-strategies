@@ -530,7 +530,7 @@ def buy_and_hold_series(sym_dict: dict, interval: str, start_date=None):
     when some stocks have shorter listing history.
     """
     normals = []
-    for sym, ticker in sym_dict.items():
+    for _, ticker in sym_dict.items():
         df = fetch_data(ticker, interval)
         if df is None or df.empty:
             continue
