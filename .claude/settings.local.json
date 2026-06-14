@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python etf_global_macd.py)",
+      "Bash(python3 etf_global_macd.py)",
+      "Bash(python3 *)",
+      "WebSearch",
+      "Bash(python *)",
+      "WebFetch(domain:dhan.co)",
+      "WebFetch(domain:zerodha.com)",
+      "WebFetch(domain:downstox.com)"
+    ]
+  }
+}
