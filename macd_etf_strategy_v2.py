@@ -79,9 +79,27 @@ IST = pytz.timezone("Asia/Kolkata")
 # ─────────────────────────────────────────────
 
 ETF_LIST = {
-    "NIFTYBEES": "NIFTYBEES.NS",
-    "GOLDBEES":  "GOLDBEES.NS",
-    "BANKBEES":  "BANKBEES.NS",
+    "NIFTYBEES":   "NIFTYBEES.NS",
+    "JUNIORBEES":  "JUNIORBEES.NS",
+    "MOM100":      "MOM100.NS",
+    "HDFCSML250":  "HDFCSML250.NS",
+    "BANKBEES":    "BANKBEES.NS",
+    "ITBEES":      "ITBEES.NS",
+    "PSUBNKBEES":  "PSUBNKBEES.NS",
+    "ICICIB22":    "ICICIB22.NS",
+    "INFRABEES":   "INFRABEES.NS",
+    "CONSUMBEES":  "CONSUMBEES.NS",
+    "PHARMABEES":  "PHARMABEES.NS",
+    "HEALTHIETF":  "HEALTHIETF.NS",
+    "MOM30IETF":   "MOM30IETF.NS",
+    "ALPHA":       "ALPHA.NS",
+    "MODEFENCE":   "MODEFENCE.NS",
+    "ALPL30IETF":  "ALPL30IETF.NS",
+    "MIDCAPETF":   "MIDCAPETF.NS",
+    "OILIETF":     "OILIETF.NS",
+    "MOSMALL250":  "MOSMALL250.NS",
+    "MOVALUE":     "MOVALUE.NS",
+    "GOLDBEES":    "GOLDBEES.NS",
 }
 
 # ─────────────────────────────────────────────
