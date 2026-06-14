@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+import plotly.express as px
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -485,6 +486,14 @@ def compute_metrics(trades_df: pd.DataFrame,
     d_std    = dr[dr < 0].std() * np.sqrt(252)
     sortino  = (ann_ret - RISK_FREE_RATE) / d_std if d_std > 0 else 0.0
 
+    # % of trading days the strategy had at least one open position
+    all_dates   = pd.bdate_range(equity.index[0], equity.index[-1])
+    open_flags  = pd.Series(False, index=all_dates)
+    for _, row in trades_df.iterrows():
+        mask = (all_dates >= row["entry_date"]) & (all_dates <= row["exit_date"])
+        open_flags |= mask
+    pct_in_market = open_flags.sum() / len(open_flags) * 100
+
     return {
         "num_trades":       len(trades_df),
         "total_net_pnl":    trades_df["net_pnl"].sum(),
@@ -505,6 +514,7 @@ def compute_metrics(trades_df: pd.DataFrame,
         "worst_trade":      trades_df["net_pnl"].min(),
         "avg_hold":         trades_df["holding_days"].mean(),
         "open_positions":   (trades_df["status"] == "OPEN (MTM)").sum(),
+        "pct_in_market":    pct_in_market,
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -579,6 +589,70 @@ def equity_chart(equity: pd.Series, nifty50,
     return fig
 
 
+def market_exposure_chart(trades_df: pd.DataFrame,
+                           equity: pd.Series) -> go.Figure:
+    """
+    Bar chart: one bar per business day.
+    Green  = deployed (≥1 position open that day).
+    Grey   = idle (no open position).
+    """
+    dates  = pd.bdate_range(equity.index[0], equity.index[-1])
+    counts = pd.Series(0, index=dates, dtype=int)
+    for _, row in trades_df.iterrows():
+        mask = (dates >= row["entry_date"]) & (dates <= row["exit_date"])
+        counts[mask] += 1
+
+    pct    = counts[counts > 0].count() / len(counts) * 100
+    colors = ["#00C9A7" if v > 0 else "#d0d0d0" for v in counts]
+
+    fig = go.Figure(go.Bar(
+        x=counts.index, y=counts.values,
+        marker_color=colors, name="Open Positions",
+        hovertemplate="%{x|%Y-%m-%d}<br>%{y} position(s) open<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Deployed vs Idle  —  Strategy in-market {pct:.1f}% of trading days  "
+              f"(green = deployed, grey = idle)",
+        height=230,
+        xaxis_title="Date", yaxis_title="# Open Positions",
+        hovermode="x unified", showlegend=False, bargap=0,
+    )
+    return fig
+
+
+def deployment_timeline_chart(trades_df: pd.DataFrame, title: str) -> go.Figure:
+    """
+    Gantt chart: one row per symbol.
+    Green bar = profitable trade, Red bar = losing trade.
+    Gaps between bars = idle (no position in that symbol).
+    """
+    df = trades_df.copy()
+    df["outcome"] = df["net_pnl"].apply(lambda x: "Profit" if x >= 0 else "Loss")
+    df["hover"]   = df.apply(
+        lambda r: (f"{r['symbol']}  |  "
+                   f"{r['entry_date'].date()} → {r['exit_date'].date()}  |  "
+                   f"{r['holding_days']}d  |  "
+                   f"₹{r['net_pnl']:,.0f}  ({r['return_pct']:.1f}%)"),
+        axis=1,
+    )
+    fig = px.timeline(
+        df.sort_values(["symbol", "entry_date"]),
+        x_start="entry_date", x_end="exit_date", y="symbol",
+        color="outcome",
+        color_discrete_map={"Profit": "#00C9A7", "Loss": "#FF6B6B"},
+        hover_name="hover",
+        title=title,
+    )
+    fig.update_yaxes(autorange="reversed")
+    n_syms = df["symbol"].nunique()
+    fig.update_layout(
+        height=max(450, n_syms * 26 + 150),
+        legend_title_text="Trade Outcome",
+        xaxis_title="Date", yaxis_title="Symbol",
+    )
+    return fig
+
+
 def pnl_dist_chart(trades_df: pd.DataFrame) -> go.Figure:
     colors = ["#00C9A7" if v >= 0 else "#FF6B6B" for v in trades_df["net_pnl"]]
     fig = go.Figure(go.Histogram(
@@ -646,10 +720,12 @@ def show_metrics(m: dict, label: str = ""):
               f"{m['num_trades']} trades")
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Profit Factor", f"{m['profit_factor']:.2f}")
-    c6.metric("Sharpe Ratio",  f"{m['sharpe']:.2f}")
-    c7.metric("Sortino Ratio", f"{m['sortino']:.2f}")
-    c8.metric("Avg Hold",      f"{m['avg_hold']:.0f} days")
+    c5.metric("Profit Factor",   f"{m['profit_factor']:.2f}")
+    c6.metric("Sharpe Ratio",    f"{m['sharpe']:.2f}")
+    c7.metric("Sortino Ratio",   f"{m['sortino']:.2f}")
+    c8.metric("% Time in Market",
+              f"{m.get('pct_in_market', 0):.1f}%",
+              f"Avg hold {m['avg_hold']:.0f}d")
 
     with st.expander("🔍 Detailed Cost & Trade Breakdown"):
         d1, d2, d3 = st.columns(3)
@@ -848,6 +924,24 @@ with tab1:
                 )
                 st.plotly_chart(drawdown_chart(equity), use_container_width=True)
 
+                st.plotly_chart(
+                    market_exposure_chart(tdf, equity),
+                    use_container_width=True,
+                )
+
+                with st.expander("📅 Strategy Deployment Timeline (per ETF)"):
+                    st.caption(
+                        "Green = profitable trade in progress | "
+                        "Red = losing trade in progress | "
+                        "Gap = idle (no position)"
+                    )
+                    st.plotly_chart(
+                        deployment_timeline_chart(
+                            tdf, "ETF Strategy — Deployed vs Idle Periods per Symbol"
+                        ),
+                        use_container_width=True,
+                    )
+
                 ca, cb = st.columns(2)
                 with ca:
                     st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
@@ -944,6 +1038,24 @@ with tab2:
                     use_container_width=True,
                 )
                 st.plotly_chart(drawdown_chart(equity), use_container_width=True)
+
+                st.plotly_chart(
+                    market_exposure_chart(tdf, equity),
+                    use_container_width=True,
+                )
+
+                with st.expander("📅 Strategy Deployment Timeline (per stock)"):
+                    st.caption(
+                        "Green = profitable trade in progress | "
+                        "Red = losing trade in progress | "
+                        "Gap = idle (no position)"
+                    )
+                    st.plotly_chart(
+                        deployment_timeline_chart(
+                            tdf, "Nifty 100 Strategy — Deployed vs Idle Periods per Symbol"
+                        ),
+                        use_container_width=True,
+                    )
 
                 ca, cb = st.columns(2)
                 with ca:
