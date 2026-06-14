@@ -189,7 +189,8 @@ def mtf_cost(entry: float, qty: int, leverage: int,
 # Exit  : Weekly MACD crosses BELOW Signal    → exit  next week's open
 # ─────────────────────────────────────────────────────────────
 
-def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate):
+def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
+                     start_date=None, end_date=None):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -202,7 +203,19 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate):
         wk = fetch_data(ticker, "1wk")
         mo = fetch_data(ticker, "1mo")
 
-        if wk is None or mo is None or len(wk) < lookback + 2:
+        if wk is None or mo is None:
+            failed.append(sym)
+            continue
+
+        # Apply date range filter AFTER fetching (data is cached unfiltered)
+        if start_date is not None:
+            wk = wk[wk.index >= start_date]
+            mo = mo[mo.index >= start_date]
+        if end_date is not None:
+            wk = wk[wk.index <= end_date]
+            mo = mo[mo.index <= end_date]
+
+        if len(wk) < lookback + 2:
             failed.append(sym)
             continue
 
@@ -308,7 +321,8 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate):
 # ─────────────────────────────────────────────────────────────
 
 def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
-                          leverage, rate, target_pct):
+                          leverage, rate, target_pct,
+                          start_date=None, end_date=None):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -321,7 +335,18 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
         dy = fetch_data(ticker, "1d")
         wk = fetch_data(ticker, "1wk")
 
-        if dy is None or wk is None or len(dy) < lookback + 2:
+        if dy is None or wk is None:
+            failed.append(sym)
+            continue
+
+        if start_date is not None:
+            dy = dy[dy.index >= start_date]
+            wk = wk[wk.index >= start_date]
+        if end_date is not None:
+            dy = dy[dy.index <= end_date]
+            wk = wk[wk.index <= end_date]
+
+        if len(dy) < lookback + 2:
             failed.append(sym)
             continue
 
@@ -486,17 +511,30 @@ def compute_metrics(trades_df: pd.DataFrame,
 # BUY-AND-HOLD BENCHMARK  (equal-weighted, same symbols)
 # ─────────────────────────────────────────────────────────────
 
-def buy_and_hold_series(sym_dict: dict, interval: str):
+def buy_and_hold_series(sym_dict: dict, interval: str, start_date=None):
+    """
+    Equal-weighted buy-and-hold normalized to 1.0 at start_date.
+    Each stock is normalized from start_date (or its own first date if no data
+    at start_date). Stocks with no data in the period are skipped.
+    Uses mean of available stocks per day (no dropna) to avoid losing history
+    when some stocks have shorter listing history.
+    """
     normals = []
     for sym, ticker in sym_dict.items():
         df = fetch_data(ticker, interval)
         if df is None or df.empty:
             continue
         close = df["Close"].dropna()
-        normals.append(close / close.iloc[0])
+        # Clip to start_date so normalization base = start of backtest period
+        if start_date is not None:
+            close = close[close.index >= pd.Timestamp(start_date)]
+        if len(close) < 2:
+            continue
+        normals.append(close / close.iloc[0])   # normalized to 1.0 at start_date
     if not normals:
         return None
-    aligned = pd.concat(normals, axis=1).ffill().dropna()
+    # mean(axis=1) ignores NaN per row — handles stocks with different listing dates
+    aligned = pd.concat(normals, axis=1)
     return aligned.mean(axis=1)
 
 # ─────────────────────────────────────────────────────────────
@@ -524,9 +562,10 @@ def equity_chart(equity: pd.Series, nifty50,
 
     if bnh is not None:
         bnh_clip = bnh[(bnh.index >= equity.index[0]) & (bnh.index <= equity.index[-1])]
-        if not bnh_clip.empty:
+        bnh_clip = bnh_clip.dropna()
+        if not bnh_clip.empty and bnh_clip.iloc[0] != 0:
             fig.add_trace(go.Scatter(
-                x=bnh_clip.index, y=(bnh_clip * 100),
+                x=bnh_clip.index, y=(bnh_clip / bnh_clip.iloc[0] * 100),
                 name="Buy & Hold (same symbols)",
                 line=dict(color="#FFA500", width=1.5, dash="dash"),
             ))
@@ -667,6 +706,25 @@ def config_panel(key_prefix: str, universe: dict,
             default=list(universe.keys()),
             key=f"{key_prefix}_symbols",
         )
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            from datetime import date as date_type
+            start_date = st.date_input(
+                "Backtest from",
+                value=date_type(2015, 1, 1),
+                min_value=date_type(2000, 1, 1),
+                max_value=date_type.today(),
+                key=f"{key_prefix}_start",
+                help="Symbols with no data before this date will start from their listing date"
+            )
+        with dcol2:
+            end_date = st.date_input(
+                "Backtest to",
+                value=date_type.today(),
+                min_value=date_type(2000, 1, 1),
+                max_value=date_type.today(),
+                key=f"{key_prefix}_end",
+            )
 
     with col2:
         fast   = st.number_input("MACD Fast",   value=default_fast,
@@ -696,7 +754,9 @@ def config_panel(key_prefix: str, universe: dict,
     run = st.button("🚀 Run Backtest", type="primary",
                     use_container_width=True, key=f"{key_prefix}_run")
 
-    return selected, int(fast), int(slow), int(signal), cash, int(leverage), rate, target, run
+    return (selected, int(fast), int(slow), int(signal),
+            cash, int(leverage), rate, target, run,
+            pd.Timestamp(start_date), pd.Timestamp(end_date))
 
 # ─────────────────────────────────────────────────────────────
 # MAIN TABS
@@ -718,7 +778,8 @@ with tab1:
 
     with st.expander("⚙️ Configure & Run", expanded=True):
         (e_syms, e_fast, e_slow, e_sig,
-         e_cash, e_lev, e_rate, _, e_run) = config_panel(
+         e_cash, e_lev, e_rate, _, e_run,
+         e_start, e_end) = config_panel(
             "etf", ALL_ETFS, 12, 24, 3, has_target=False
         )
 
@@ -732,24 +793,52 @@ with tab1:
             st.info(
                 f"Running on **{len(sel_etfs)} ETFs** | "
                 f"₹{e_cash:,} × {e_lev}x = ₹{e_cash * e_lev:,} per ETF | "
-                f"Total capital: ₹{total_cap:,}"
+                f"Total capital: ₹{total_cap:,} | "
+                f"Period: **{e_start.date()} → {e_end.date()}**"
             )
 
             with st.spinner("Fetching data & running backtest..."):
                 tdf, failed = run_etf_backtest(
-                    sel_etfs, e_fast, e_slow, e_sig, e_cash, e_lev, e_rate
+                    sel_etfs, e_fast, e_slow, e_sig, e_cash, e_lev, e_rate,
+                    start_date=e_start, end_date=e_end
                 )
 
             if failed:
                 st.warning(f"⚠️ No data for: {', '.join(failed)}")
 
             if tdf.empty:
-                st.error("No trades generated. Try adjusting MACD parameters.")
+                st.error("No trades generated. Try adjusting MACD parameters or date range.")
             else:
                 equity  = build_equity_curve(tdf, total_cap)
                 metrics = compute_metrics(tdf, equity, total_cap)
                 n50     = fetch_nifty50()
-                bnh     = buy_and_hold_series(sel_etfs, "1wk")
+                bnh     = buy_and_hold_series(sel_etfs, "1wk", start_date=equity.index[0])
+
+                first_trade = tdf["entry_date"].min().date()
+                last_trade  = tdf["exit_date"].max().date()
+                years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+                st.success(
+                    f"📅 **Backtest period: {first_trade}  →  {last_trade} "
+                    f"({years_tested:.1f} years)**  |  "
+                    f"Symbols with data before {e_start.date()} started from their "
+                    f"listing date instead"
+                )
+
+                # Per-symbol data range table
+                with st.expander("📊 Per-symbol data range"):
+                    sym_summary = (
+                        tdf.groupby("symbol")
+                        .agg(first_trade=("entry_date", "min"),
+                             last_trade=("exit_date", "max"),
+                             num_trades=("net_pnl", "count"),
+                             net_pnl=("net_pnl", "sum"))
+                        .reset_index()
+                        .sort_values("first_trade")
+                    )
+                    sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
+                    sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
+                    sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
+                    st.dataframe(sym_summary, use_container_width=True)
 
                 show_metrics(metrics, "ETF Strategy")
                 st.plotly_chart(
@@ -781,7 +870,8 @@ with tab2:
 
     with st.expander("⚙️ Configure & Run", expanded=True):
         (n_syms, n_fast, n_slow, n_sig,
-         n_cash, n_lev, n_rate, n_target, n_run) = config_panel(
+         n_cash, n_lev, n_rate, n_target, n_run,
+         n_start, n_end) = config_panel(
             "n100", NIFTY100_STOCKS, 12, 24, 3, has_target=True
         )
 
@@ -796,7 +886,8 @@ with tab2:
                 f"Running on **{len(sel_stocks)} stocks** | "
                 f"₹{n_cash:,} × {n_lev}x = ₹{n_cash * n_lev:,} per stock | "
                 f"Total capital: ₹{total_cap:,} | "
-                f"Target exit: {n_target*100:.1f}%"
+                f"Target: {n_target*100:.1f}% | "
+                f"Period: **{n_start.date()} → {n_end.date()}**"
             )
             if len(sel_stocks) > 30:
                 st.warning(
@@ -807,19 +898,44 @@ with tab2:
             with st.spinner("Fetching data & running backtest..."):
                 tdf, failed = run_nifty100_backtest(
                     sel_stocks, n_fast, n_slow, n_sig,
-                    n_cash, n_lev, n_rate, n_target
+                    n_cash, n_lev, n_rate, n_target,
+                    start_date=n_start, end_date=n_end
                 )
 
             if failed:
                 st.warning(f"⚠️ No data for: {', '.join(failed)}")
 
             if tdf.empty:
-                st.error("No trades generated. Try adjusting MACD parameters.")
+                st.error("No trades generated. Try adjusting MACD parameters or date range.")
             else:
                 equity  = build_equity_curve(tdf, total_cap)
                 metrics = compute_metrics(tdf, equity, total_cap)
                 n50     = fetch_nifty50()
-                bnh     = buy_and_hold_series(sel_stocks, "1d")
+                bnh     = buy_and_hold_series(sel_stocks, "1d", start_date=equity.index[0])
+
+                first_trade  = tdf["entry_date"].min().date()
+                last_trade   = tdf["exit_date"].max().date()
+                years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+                st.success(
+                    f"📅 **Backtest period: {first_trade}  →  {last_trade} "
+                    f"({years_tested:.1f} years)**  |  "
+                    f"Stocks listed after {n_start.date()} start from their listing date instead"
+                )
+
+                with st.expander("📊 Per-symbol data range"):
+                    sym_summary = (
+                        tdf.groupby("symbol")
+                        .agg(first_trade=("entry_date", "min"),
+                             last_trade=("exit_date", "max"),
+                             num_trades=("net_pnl", "count"),
+                             net_pnl=("net_pnl", "sum"))
+                        .reset_index()
+                        .sort_values("first_trade")
+                    )
+                    sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
+                    sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
+                    sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
+                    st.dataframe(sym_summary, use_container_width=True)
 
                 show_metrics(metrics, "Nifty 100 Strategy")
                 st.plotly_chart(
