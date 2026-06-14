@@ -890,15 +890,22 @@ with tab1:
                 n50     = fetch_nifty50()
                 bnh     = buy_and_hold_series(sel_etfs, "1wk", start_date=equity.index[0])
 
-                first_trade = tdf["entry_date"].min().date()
-                last_trade  = tdf["exit_date"].max().date()
+                first_trade  = tdf["entry_date"].min().date()
+                last_trade   = tdf["exit_date"].max().date()
                 years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+                warmup_days  = (tdf["entry_date"].min() - e_start).days
                 st.success(
-                    f"📅 **Backtest period: {first_trade}  →  {last_trade} "
-                    f"({years_tested:.1f} years)**  |  "
-                    f"Symbols with data before {e_start.date()} started from their "
-                    f"listing date instead"
+                    f"📅 **Configured:** {e_start.date()} → {e_end.date()}  |  "
+                    f"**First actual trade:** {first_trade}  |  "
+                    f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
                 )
+                if warmup_days > 30:
+                    st.caption(
+                        f"ℹ️ Start shifted by ~{warmup_days} days: MACD({e_fast},{e_slow},{e_sig}) "
+                        f"on weekly data needs {e_slow + e_sig + 2} candles (~"
+                        f"{(e_slow + e_sig + 2) // 4} months) of warmup before the first "
+                        "signal can fire. End date reflects last available data / last exit signal."
+                    )
 
                 # Per-symbol data range table
                 with st.expander("📊 Per-symbol data range"):
@@ -1010,11 +1017,19 @@ with tab2:
                 first_trade  = tdf["entry_date"].min().date()
                 last_trade   = tdf["exit_date"].max().date()
                 years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+                warmup_days  = (tdf["entry_date"].min() - n_start).days
                 st.success(
-                    f"📅 **Backtest period: {first_trade}  →  {last_trade} "
-                    f"({years_tested:.1f} years)**  |  "
-                    f"Stocks listed after {n_start.date()} start from their listing date instead"
+                    f"📅 **Configured:** {n_start.date()} → {n_end.date()}  |  "
+                    f"**First actual trade:** {first_trade}  |  "
+                    f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
                 )
+                if warmup_days > 30:
+                    st.caption(
+                        f"ℹ️ Start shifted by ~{warmup_days} days: MACD({n_fast},{n_slow},{n_sig}) "
+                        f"on daily data needs {n_slow + n_sig + 2} candles (~"
+                        f"{(n_slow + n_sig + 2) // 21} months) of warmup before the first "
+                        "signal can fire. End date reflects last available data / last exit signal."
+                    )
 
                 with st.expander("📊 Per-symbol data range"):
                     sym_summary = (
