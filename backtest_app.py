@@ -879,83 +879,104 @@ with tab1:
                     start_date=e_start, end_date=e_end
                 )
 
-            if failed:
-                st.warning(f"⚠️ No data for: {', '.join(failed)}")
-
             if tdf.empty:
                 st.error("No trades generated. Try adjusting MACD parameters or date range.")
             else:
                 equity  = build_equity_curve(tdf, total_cap)
                 metrics = compute_metrics(tdf, equity, total_cap)
-                n50     = fetch_nifty50()
-                bnh     = buy_and_hold_series(sel_etfs, "1wk", start_date=equity.index[0])
-
-                first_trade  = tdf["entry_date"].min().date()
-                last_trade   = tdf["exit_date"].max().date()
-                years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
-                warmup_days  = (tdf["entry_date"].min() - e_start).days
-                st.success(
-                    f"📅 **Configured:** {e_start.date()} → {e_end.date()}  |  "
-                    f"**First actual trade:** {first_trade}  |  "
-                    f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
-                )
-                if warmup_days > 30:
-                    st.caption(
-                        f"ℹ️ Start shifted by ~{warmup_days} days: MACD({e_fast},{e_slow},{e_sig}) "
-                        f"on weekly data needs {e_slow + e_sig + 2} candles (~"
-                        f"{(e_slow + e_sig + 2) // 4} months) of warmup before the first "
-                        "signal can fire. End date reflects last available data / last exit signal."
-                    )
-
-                # Per-symbol data range table
-                with st.expander("📊 Per-symbol data range"):
-                    sym_summary = (
-                        tdf.groupby("symbol")
-                        .agg(first_trade=("entry_date", "min"),
-                             last_trade=("exit_date", "max"),
-                             num_trades=("net_pnl", "count"),
-                             net_pnl=("net_pnl", "sum"))
-                        .reset_index()
-                        .sort_values("first_trade")
-                    )
-                    sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
-                    sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
-                    sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
-                    st.dataframe(sym_summary, use_container_width=True)
-
-                show_metrics(metrics, "ETF Strategy")
-                st.plotly_chart(
-                    equity_chart(equity, n50, bnh,
-                                 "ETF Strategy — Equity Curve vs Benchmarks"),
-                    use_container_width=True,
-                )
-                st.plotly_chart(drawdown_chart(equity), use_container_width=True)
-
-                st.plotly_chart(
-                    market_exposure_chart(tdf, equity),
-                    use_container_width=True,
+                st.session_state["etf_results"] = dict(
+                    tdf=tdf, equity=equity, metrics=metrics, failed=failed,
+                    total_cap=total_cap, sel_etfs=sel_etfs,
+                    e_start=e_start, e_end=e_end,
+                    e_fast=e_fast, e_slow=e_slow, e_sig=e_sig,
                 )
 
-                with st.expander("📅 Strategy Deployment Timeline (per ETF)"):
-                    st.caption(
-                        "Green = profitable trade in progress | "
-                        "Red = losing trade in progress | "
-                        "Gap = idle (no position)"
-                    )
-                    st.plotly_chart(
-                        deployment_timeline_chart(
-                            tdf, "ETF Strategy — Deployed vs Idle Periods per Symbol"
-                        ),
-                        use_container_width=True,
-                    )
+    if "etf_results" in st.session_state:
+        r         = st.session_state["etf_results"]
+        tdf       = r["tdf"]
+        equity    = r["equity"]
+        metrics   = r["metrics"]
+        failed    = r["failed"]
+        total_cap = r["total_cap"]
+        sel_etfs  = r["sel_etfs"]
+        e_start_r = r["e_start"]
+        e_end_r   = r["e_end"]
+        e_fast_r  = r["e_fast"]
+        e_slow_r  = r["e_slow"]
+        e_sig_r   = r["e_sig"]
 
-                ca, cb = st.columns(2)
-                with ca:
-                    st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
-                with cb:
-                    st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
+        # n50 and bnh are @st.cache_data — fast to recompute, no need to store in state
+        n50 = fetch_nifty50()
+        bnh = buy_and_hold_series(sel_etfs, "1wk", start_date=equity.index[0])
 
-                show_trade_log(tdf, "etf_backtest_trades.csv")
+        if failed:
+            st.warning(f"⚠️ No data for: {', '.join(failed)}")
+
+        first_trade  = tdf["entry_date"].min().date()
+        last_trade   = tdf["exit_date"].max().date()
+        years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+        warmup_days  = (tdf["entry_date"].min() - e_start_r).days
+        st.success(
+            f"📅 **Configured:** {e_start_r.date()} → {e_end_r.date()}  |  "
+            f"**First actual trade:** {first_trade}  |  "
+            f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
+        )
+        if warmup_days > 30:
+            st.caption(
+                f"ℹ️ Start shifted by ~{warmup_days} days: MACD({e_fast_r},{e_slow_r},{e_sig_r}) "
+                f"on weekly data needs {e_slow_r + e_sig_r + 2} candles (~"
+                f"{(e_slow_r + e_sig_r + 2) // 4} months) of warmup before the first "
+                "signal can fire. End date reflects last available data / last exit signal."
+            )
+
+        with st.expander("📊 Per-symbol data range"):
+            sym_summary = (
+                tdf.groupby("symbol")
+                .agg(first_trade=("entry_date", "min"),
+                     last_trade=("exit_date", "max"),
+                     num_trades=("net_pnl", "count"),
+                     net_pnl=("net_pnl", "sum"))
+                .reset_index()
+                .sort_values("first_trade")
+            )
+            sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
+            sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
+            sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
+            st.dataframe(sym_summary, use_container_width=True)
+
+        show_metrics(metrics, "ETF Strategy")
+        st.plotly_chart(
+            equity_chart(equity, n50, bnh,
+                         "ETF Strategy — Equity Curve vs Benchmarks"),
+            use_container_width=True,
+        )
+        st.plotly_chart(drawdown_chart(equity), use_container_width=True)
+
+        st.plotly_chart(
+            market_exposure_chart(tdf, equity),
+            use_container_width=True,
+        )
+
+        with st.expander("📅 Strategy Deployment Timeline (per ETF)"):
+            st.caption(
+                "Green = profitable trade in progress | "
+                "Red = losing trade in progress | "
+                "Gap = idle (no position)"
+            )
+            st.plotly_chart(
+                deployment_timeline_chart(
+                    tdf, "ETF Strategy — Deployed vs Idle Periods per Symbol"
+                ),
+                use_container_width=True,
+            )
+
+        ca, cb = st.columns(2)
+        with ca:
+            st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
+        with cb:
+            st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
+
+        show_trade_log(tdf, "etf_backtest_trades.csv")
 
 # ════════════════════════════════════════════════════════════
 # TAB 2 — NIFTY 100 STRATEGY
@@ -1003,88 +1024,108 @@ with tab2:
                     start_date=n_start, end_date=n_end
                 )
 
-            if failed:
-                st.warning(f"⚠️ No data for: {', '.join(failed)}")
-
             if tdf.empty:
                 st.error("No trades generated. Try adjusting MACD parameters or date range.")
             else:
                 equity  = build_equity_curve(tdf, total_cap)
                 metrics = compute_metrics(tdf, equity, total_cap)
-                n50     = fetch_nifty50()
-                bnh     = buy_and_hold_series(sel_stocks, "1d", start_date=equity.index[0])
-
-                first_trade  = tdf["entry_date"].min().date()
-                last_trade   = tdf["exit_date"].max().date()
-                years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
-                warmup_days  = (tdf["entry_date"].min() - n_start).days
-                st.success(
-                    f"📅 **Configured:** {n_start.date()} → {n_end.date()}  |  "
-                    f"**First actual trade:** {first_trade}  |  "
-                    f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
-                )
-                if warmup_days > 30:
-                    st.caption(
-                        f"ℹ️ Start shifted by ~{warmup_days} days: MACD({n_fast},{n_slow},{n_sig}) "
-                        f"on daily data needs {n_slow + n_sig + 2} candles (~"
-                        f"{(n_slow + n_sig + 2) // 21} months) of warmup before the first "
-                        "signal can fire. End date reflects last available data / last exit signal."
-                    )
-
-                with st.expander("📊 Per-symbol data range"):
-                    sym_summary = (
-                        tdf.groupby("symbol")
-                        .agg(first_trade=("entry_date", "min"),
-                             last_trade=("exit_date", "max"),
-                             num_trades=("net_pnl", "count"),
-                             net_pnl=("net_pnl", "sum"))
-                        .reset_index()
-                        .sort_values("first_trade")
-                    )
-                    sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
-                    sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
-                    sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
-                    st.dataframe(sym_summary, use_container_width=True)
-
-                show_metrics(metrics, "Nifty 100 Strategy")
-                st.plotly_chart(
-                    equity_chart(equity, n50, bnh,
-                                 "Nifty 100 Strategy — Equity Curve vs Benchmarks"),
-                    use_container_width=True,
-                )
-                st.plotly_chart(drawdown_chart(equity), use_container_width=True)
-
-                st.plotly_chart(
-                    market_exposure_chart(tdf, equity),
-                    use_container_width=True,
+                st.session_state["n100_results"] = dict(
+                    tdf=tdf, equity=equity, metrics=metrics, failed=failed,
+                    total_cap=total_cap, sel_stocks=sel_stocks,
+                    n_start=n_start, n_end=n_end,
+                    n_fast=n_fast, n_slow=n_slow, n_sig=n_sig,
                 )
 
-                with st.expander("📅 Strategy Deployment Timeline (per stock)"):
-                    st.caption(
-                        "Green = profitable trade in progress | "
-                        "Red = losing trade in progress | "
-                        "Gap = idle (no position)"
-                    )
-                    st.plotly_chart(
-                        deployment_timeline_chart(
-                            tdf, "Nifty 100 Strategy — Deployed vs Idle Periods per Symbol"
-                        ),
-                        use_container_width=True,
-                    )
+    if "n100_results" in st.session_state:
+        r         = st.session_state["n100_results"]
+        tdf       = r["tdf"]
+        equity    = r["equity"]
+        metrics   = r["metrics"]
+        failed    = r["failed"]
+        total_cap = r["total_cap"]
+        sel_stocks = r["sel_stocks"]
+        n_start_r  = r["n_start"]
+        n_end_r    = r["n_end"]
+        n_fast_r   = r["n_fast"]
+        n_slow_r   = r["n_slow"]
+        n_sig_r    = r["n_sig"]
 
-                ca, cb = st.columns(2)
-                with ca:
-                    st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
-                with cb:
-                    st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
+        n50 = fetch_nifty50()
+        bnh = buy_and_hold_series(sel_stocks, "1d", start_date=equity.index[0])
 
-                # Exit reason summary
-                if "exit_reason" in tdf.columns:
-                    st.subheader("Exit Reason Breakdown")
-                    rc = tdf["exit_reason"].value_counts()
-                    r1, r2, r3 = st.columns(3)
-                    r1.metric("MACD Crossover Exit", int(rc.get("MACD_EXIT", 0)))
-                    r2.metric("Target Hit",           int(rc.get("TARGET",   0)))
-                    r3.metric("Still Open (MTM)",     int(rc.get("OPEN",     0)))
+        if failed:
+            st.warning(f"⚠️ No data for: {', '.join(failed)}")
 
-                show_trade_log(tdf, "nifty100_backtest_trades.csv")
+        first_trade  = tdf["entry_date"].min().date()
+        last_trade   = tdf["exit_date"].max().date()
+        years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+        warmup_days  = (tdf["entry_date"].min() - n_start_r).days
+        st.success(
+            f"📅 **Configured:** {n_start_r.date()} → {n_end_r.date()}  |  "
+            f"**First actual trade:** {first_trade}  |  "
+            f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
+        )
+        if warmup_days > 30:
+            st.caption(
+                f"ℹ️ Start shifted by ~{warmup_days} days: MACD({n_fast_r},{n_slow_r},{n_sig_r}) "
+                f"on daily data needs {n_slow_r + n_sig_r + 2} candles (~"
+                f"{(n_slow_r + n_sig_r + 2) // 21} months) of warmup before the first "
+                "signal can fire. End date reflects last available data / last exit signal."
+            )
+
+        with st.expander("📊 Per-symbol data range"):
+            sym_summary = (
+                tdf.groupby("symbol")
+                .agg(first_trade=("entry_date", "min"),
+                     last_trade=("exit_date", "max"),
+                     num_trades=("net_pnl", "count"),
+                     net_pnl=("net_pnl", "sum"))
+                .reset_index()
+                .sort_values("first_trade")
+            )
+            sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
+            sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
+            sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
+            st.dataframe(sym_summary, use_container_width=True)
+
+        show_metrics(metrics, "Nifty 100 Strategy")
+        st.plotly_chart(
+            equity_chart(equity, n50, bnh,
+                         "Nifty 100 Strategy — Equity Curve vs Benchmarks"),
+            use_container_width=True,
+        )
+        st.plotly_chart(drawdown_chart(equity), use_container_width=True)
+
+        st.plotly_chart(
+            market_exposure_chart(tdf, equity),
+            use_container_width=True,
+        )
+
+        with st.expander("📅 Strategy Deployment Timeline (per stock)"):
+            st.caption(
+                "Green = profitable trade in progress | "
+                "Red = losing trade in progress | "
+                "Gap = idle (no position)"
+            )
+            st.plotly_chart(
+                deployment_timeline_chart(
+                    tdf, "Nifty 100 Strategy — Deployed vs Idle Periods per Symbol"
+                ),
+                use_container_width=True,
+            )
+
+        ca, cb = st.columns(2)
+        with ca:
+            st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
+        with cb:
+            st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
+
+        if "exit_reason" in tdf.columns:
+            st.subheader("Exit Reason Breakdown")
+            rc = tdf["exit_reason"].value_counts()
+            r1, r2, r3 = st.columns(3)
+            r1.metric("MACD Crossover Exit", int(rc.get("MACD_EXIT", 0)))
+            r2.metric("Target Hit",           int(rc.get("TARGET",   0)))
+            r3.metric("Still Open (MTM)",     int(rc.get("OPEN",     0)))
+
+        show_trade_log(tdf, "nifty100_backtest_trades.csv")
