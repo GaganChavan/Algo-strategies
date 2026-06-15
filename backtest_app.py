@@ -981,15 +981,17 @@ def criteria_panel(key_prefix: str, htf_label: str,
                     help="Take profit: exit next open if close hits this % above entry.",
                 ) / 100
 
-    return dict(
+    rules = dict(
         use_htf_filter=use_htf,
         entry_trigger=entry_trig,
         exit_trigger=exit_trig,
         sma_period=int(sma_period),
         stop_loss_pct=stop_loss,
         trailing_stop_pct=trailing_stop,
-        target_pct=target_pct,
     )
+    if has_target:
+        rules["target_pct"] = target_pct
+    return rules
 
 
 def exit_reason_breakdown(tdf: pd.DataFrame):
