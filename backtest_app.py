@@ -191,7 +191,10 @@ def mtf_cost(entry: float, qty: int, leverage: int,
 # ─────────────────────────────────────────────────────────────
 
 def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
-                     start_date=None, end_date=None):
+                     start_date=None, end_date=None,
+                     use_htf_filter=True, entry_trigger="crossover",
+                     exit_trigger="crossover", sma_period=0,
+                     stop_loss_pct=0.0, target_pct=0.0, trailing_stop_pct=0.0):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -208,7 +211,6 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
             failed.append(sym)
             continue
 
-        # Apply date range filter AFTER fetching (data is cached unfiltered)
         if start_date is not None:
             wk = wk[wk.index >= start_date]
             mo = mo[mo.index >= start_date]
@@ -226,28 +228,40 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
             failed.append(sym)
             continue
 
-        in_pos, ep, ed, qty_ = False, 0.0, None, 0
+        in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         for i in range(lookback, len(wk) - 1):
             w_date = wk.index[i]
 
             if not in_pos:
-                # Monthly trend filter
-                mo_slice = mo_m[mo_m.index <= w_date]
-                if len(mo_slice) < 2:
-                    continue
-                if mo_slice["macd"].iloc[-1] <= mo_slice["signal"].iloc[-1]:
-                    continue
+                # Higher timeframe filter (configurable)
+                if use_htf_filter:
+                    mo_slice = mo_m[mo_m.index <= w_date]
+                    if len(mo_slice) < 2:
+                        continue
+                    if mo_slice["macd"].iloc[-1] <= mo_slice["signal"].iloc[-1]:
+                        continue
 
-                # Weekly crossover UP
+                # SMA price filter (configurable)
+                if sma_period > 0:
+                    sma_val = wk["Close"].rolling(sma_period).mean().iloc[i]
+                    if pd.isna(sma_val) or wk["Close"].iloc[i] <= sma_val:
+                        continue
+
+                # Weekly entry trigger (configurable)
                 pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
                 cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
                 if pd.isna(pm) or pd.isna(cm):
                     continue
-                if not (pm < ps and cm > cs):
+                if entry_trigger == "crossover":
+                    entry_ok = pm <= ps and cm > cs
+                elif entry_trigger == "above_signal":
+                    entry_ok = cm > cs
+                else:  # above_zero
+                    entry_ok = pm <= 0 and cm > 0
+                if not entry_ok:
                     continue
 
-                # Enter at next week's open (Monday open)
                 next_open = wk["Open"].iloc[i + 1]
                 if pd.isna(next_open) or float(next_open) <= 0:
                     continue
@@ -257,15 +271,39 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
                     continue
 
                 ep, ed, in_pos = float(next_open), wk.index[i + 1], True
+                peak_p = ep
 
             else:
-                # Weekly crossover DOWN → exit
+                curr_close = float(wk["Close"].iloc[i])
+
+                # Update trailing stop peak
+                if curr_close > peak_p:
+                    peak_p = curr_close
+
+                # Price-based exits
+                stop_hit   = stop_loss_pct    > 0 and curr_close <= ep     * (1 - stop_loss_pct)
+                target_hit = target_pct        > 0 and curr_close >= ep     * (1 + target_pct)
+                trail_hit  = trailing_stop_pct > 0 and curr_close <= peak_p * (1 - trailing_stop_pct)
+
+                # MACD exit trigger (configurable)
                 pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
                 cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
                 if pd.isna(pm) or pd.isna(cm):
+                    macd_exit = False
+                elif exit_trigger == "crossover":
+                    macd_exit = pm >= ps and cm < cs
+                elif exit_trigger == "below_signal":
+                    macd_exit = cm < cs
+                else:  # below_zero
+                    macd_exit = pm >= 0 and cm < 0
+
+                if not (stop_hit or target_hit or trail_hit or macd_exit):
                     continue
-                if not (pm > ps and cm < cs):
-                    continue
+
+                if stop_hit:       exit_reason = "STOP_LOSS"
+                elif target_hit:   exit_reason = "TARGET"
+                elif trail_hit:    exit_reason = "TRAIL_STOP"
+                else:              exit_reason = "MACD_EXIT"
 
                 xp   = float(wk["Open"].iloc[i + 1])
                 xd   = wk.index[i + 1]
@@ -279,15 +317,14 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
                 trades.append(dict(
                     symbol=sym, entry_date=ed, exit_date=xd,
                     entry_price=round(ep, 2), exit_price=round(xp, 2),
-                    qty=qty_, holding_days=days,
+                    qty=qty_, holding_days=days, exit_reason=exit_reason,
                     gross_pnl=round(gp, 2), costs=round(cst, 2),
                     mtf_interest=round(mti, 2), net_pnl=round(np_, 2),
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
-                in_pos, ep, ed, qty_ = False, 0.0, None, 0
+                in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
-        # Mark open position at last close
         if in_pos:
             xp   = float(wk["Close"].iloc[-1])
             xd   = wk.index[-1]
@@ -300,7 +337,7 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
             trades.append(dict(
                 symbol=sym, entry_date=ed, exit_date=xd,
                 entry_price=round(ep, 2), exit_price=round(xp, 2),
-                qty=qty_, holding_days=days,
+                qty=qty_, holding_days=days, exit_reason="OPEN",
                 gross_pnl=round(gp, 2), costs=round(cst, 2),
                 mtf_interest=round(mti, 2), net_pnl=round(np_, 2),
                 return_pct=round(np_ / cash_used * 100, 2),
@@ -323,7 +360,10 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
 
 def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                           leverage, rate, target_pct,
-                          start_date=None, end_date=None):
+                          start_date=None, end_date=None,
+                          use_htf_filter=True, entry_trigger="crossover",
+                          exit_trigger="crossover", sma_period=0,
+                          stop_loss_pct=0.0, trailing_stop_pct=0.0):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -357,25 +397,38 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
             failed.append(sym)
             continue
 
-        in_pos, ep, ed, qty_ = False, 0.0, None, 0
+        in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         for i in range(lookback, len(dy) - 1):
             d_date = dy.index[i]
 
             if not in_pos:
-                # Weekly trend filter
-                wk_slice = wk_m[wk_m.index <= d_date]
-                if len(wk_slice) < 2:
-                    continue
-                if wk_slice["macd"].iloc[-1] <= wk_slice["signal"].iloc[-1]:
-                    continue
+                # Higher timeframe filter (configurable)
+                if use_htf_filter:
+                    wk_slice = wk_m[wk_m.index <= d_date]
+                    if len(wk_slice) < 2:
+                        continue
+                    if wk_slice["macd"].iloc[-1] <= wk_slice["signal"].iloc[-1]:
+                        continue
 
-                # Daily crossover UP
+                # SMA price filter (configurable)
+                if sma_period > 0:
+                    sma_val = dy["Close"].rolling(sma_period).mean().iloc[i]
+                    if pd.isna(sma_val) or dy["Close"].iloc[i] <= sma_val:
+                        continue
+
+                # Daily entry trigger (configurable)
                 pm = dy_m["macd"].iloc[i - 1];   ps = dy_m["signal"].iloc[i - 1]
                 cm = dy_m["macd"].iloc[i];        cs = dy_m["signal"].iloc[i]
                 if pd.isna(pm) or pd.isna(cm):
                     continue
-                if not (pm < ps and cm > cs):
+                if entry_trigger == "crossover":
+                    entry_ok = pm <= ps and cm > cs
+                elif entry_trigger == "above_signal":
+                    entry_ok = cm > cs
+                else:  # above_zero
+                    entry_ok = pm <= 0 and cm > 0
+                if not entry_ok:
                     continue
 
                 next_open = dy["Open"].iloc[i + 1]
@@ -387,20 +440,40 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                     continue
 
                 ep, ed, in_pos = float(next_open), dy.index[i + 1], True
+                peak_p = ep
 
             else:
-                last_close  = float(dy["Close"].iloc[i])
-                target_hit  = last_close >= ep * (1 + target_pct)
+                curr_close = float(dy["Close"].iloc[i])
 
+                # Update trailing stop peak
+                if curr_close > peak_p:
+                    peak_p = curr_close
+
+                # Price-based exits
+                stop_hit   = stop_loss_pct    > 0 and curr_close <= ep     * (1 - stop_loss_pct)
+                target_hit = target_pct        > 0 and curr_close >= ep     * (1 + target_pct)
+                trail_hit  = trailing_stop_pct > 0 and curr_close <= peak_p * (1 - trailing_stop_pct)
+
+                # MACD exit trigger (configurable)
                 pm = dy_m["macd"].iloc[i - 1];   ps = dy_m["signal"].iloc[i - 1]
                 cm = dy_m["macd"].iloc[i];        cs = dy_m["signal"].iloc[i]
-                macd_exit = False if (pd.isna(pm) or pd.isna(cm)) \
-                            else (pm > ps and cm < cs)
+                if pd.isna(pm) or pd.isna(cm):
+                    macd_exit = False
+                elif exit_trigger == "crossover":
+                    macd_exit = pm >= ps and cm < cs
+                elif exit_trigger == "below_signal":
+                    macd_exit = cm < cs
+                else:  # below_zero
+                    macd_exit = pm >= 0 and cm < 0
 
-                if not (target_hit or macd_exit):
+                if not (stop_hit or target_hit or trail_hit or macd_exit):
                     continue
 
-                reason = "TARGET" if target_hit else "MACD_EXIT"
+                if stop_hit:       reason = "STOP_LOSS"
+                elif target_hit:   reason = "TARGET"
+                elif trail_hit:    reason = "TRAIL_STOP"
+                else:              reason = "MACD_EXIT"
+
                 xp     = float(dy["Open"].iloc[i + 1])
                 xd     = dy.index[i + 1]
                 days   = max((xd - ed).days, 1)
@@ -419,7 +492,7 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
-                in_pos, ep, ed, qty_ = False, 0.0, None, 0
+                in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         if in_pos:
             xp   = float(dy["Close"].iloc[-1])
@@ -835,6 +908,109 @@ def config_panel(key_prefix: str, universe: dict,
             pd.Timestamp(start_date), pd.Timestamp(end_date))
 
 # ─────────────────────────────────────────────────────────────
+# ENTRY / EXIT CRITERIA PANEL  (shared UI component)
+# ─────────────────────────────────────────────────────────────
+
+def criteria_panel(key_prefix: str, htf_label: str,
+                   has_target: bool = False, default_target: float = 0.0) -> dict:
+    """
+    Configurable entry & exit rules expander.
+    Returns a dict with all rule settings to pass into the backtest engine.
+    """
+    with st.expander("🎯 Entry & Exit Rules", expanded=False):
+        ec, xc = st.columns(2)
+
+        with ec:
+            st.markdown("**Entry Criteria**")
+            use_htf = st.checkbox(
+                f"Require {htf_label} MACD > Signal (trend filter)",
+                value=True, key=f"{key_prefix}_use_htf",
+                help="OFF = skip the higher-timeframe filter. More trades but more whipsaws.",
+            )
+            entry_trig = st.selectbox(
+                "Entry trigger", key=f"{key_prefix}_entry_trig",
+                options=["crossover", "above_signal", "above_zero"],
+                format_func=lambda x: {
+                    "crossover":    "MACD crosses above Signal ↑  (default)",
+                    "above_signal": "MACD already > Signal  (no crossover needed)",
+                    "above_zero":   "MACD crosses above Zero line",
+                }[x],
+                help="crossover = strictest (current candle flips above). "
+                     "above_signal = enter anytime MACD is above signal (more trades). "
+                     "above_zero = only enter when MACD itself turns positive.",
+            )
+            sma_period = st.selectbox(
+                "Additional SMA price filter", key=f"{key_prefix}_sma",
+                options=[0, 10, 20, 50],
+                format_func=lambda x: "Off" if x == 0 else f"Close must be above SMA({x})",
+                help="Extra confirmation: only enter if price is above its N-period moving average.",
+            )
+
+        with xc:
+            st.markdown("**Exit Criteria**")
+            exit_trig = st.selectbox(
+                "Exit trigger", key=f"{key_prefix}_exit_trig",
+                options=["crossover", "below_signal", "below_zero"],
+                format_func=lambda x: {
+                    "crossover":    "MACD crosses below Signal ↓  (default)",
+                    "below_signal": "MACD already < Signal  (no crossover needed)",
+                    "below_zero":   "MACD crosses below Zero line  (stay longer)",
+                }[x],
+                help="crossover = exit when MACD dips below signal. "
+                     "below_signal = exit the moment MACD < signal (earlier). "
+                     "below_zero = stay in until MACD turns negative (rides trend longer).",
+            )
+            stop_loss = st.number_input(
+                "Stop Loss % from entry  (0 = off)", value=0.0,
+                min_value=0.0, max_value=50.0, step=0.5,
+                key=f"{key_prefix}_sl",
+                help="Hard stop: exit next open if close drops this % below entry price.",
+            ) / 100
+            trailing_stop = st.number_input(
+                "Trailing Stop % from peak  (0 = off)", value=0.0,
+                min_value=0.0, max_value=30.0, step=0.5,
+                key=f"{key_prefix}_trail",
+                help="Exit next open if close drops this % from the highest close since entry.",
+            ) / 100
+            target_pct = 0.0
+            if has_target:
+                target_pct = st.number_input(
+                    "Target % from entry  (0 = off)", value=default_target * 100,
+                    min_value=0.0, max_value=100.0, step=0.5,
+                    key=f"{key_prefix}_tgt",
+                    help="Take profit: exit next open if close hits this % above entry.",
+                ) / 100
+
+    return dict(
+        use_htf_filter=use_htf,
+        entry_trigger=entry_trig,
+        exit_trigger=exit_trig,
+        sma_period=int(sma_period),
+        stop_loss_pct=stop_loss,
+        trailing_stop_pct=trailing_stop,
+        target_pct=target_pct,
+    )
+
+
+def exit_reason_breakdown(tdf: pd.DataFrame):
+    """Show a breakdown of why trades exited."""
+    if "exit_reason" not in tdf.columns:
+        return
+    st.subheader("Exit Reason Breakdown")
+    rc = tdf["exit_reason"].value_counts()
+    cols = st.columns(5)
+    labels = [
+        ("MACD_EXIT",  "MACD Exit"),
+        ("TARGET",     "Target Hit"),
+        ("STOP_LOSS",  "Stop Loss"),
+        ("TRAIL_STOP", "Trailing Stop"),
+        ("OPEN",       "Still Open (MTM)"),
+    ]
+    for col, (key, label) in zip(cols, labels):
+        col.metric(label, int(rc.get(key, 0)))
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────────────────
 
@@ -859,6 +1035,8 @@ with tab1:
             "etf", ALL_ETFS, 12, 24, 3, has_target=False
         )
 
+    e_rules = criteria_panel("etf", htf_label="Monthly", has_target=True, default_target=0.0)
+
     if e_run:
         if not e_syms:
             st.error("Select at least one ETF.")
@@ -876,7 +1054,8 @@ with tab1:
             with st.spinner("Fetching data & running backtest..."):
                 tdf, failed = run_etf_backtest(
                     sel_etfs, e_fast, e_slow, e_sig, e_cash, e_lev, e_rate,
-                    start_date=e_start, end_date=e_end
+                    start_date=e_start, end_date=e_end,
+                    **e_rules,
                 )
 
             if tdf.empty:
@@ -976,6 +1155,7 @@ with tab1:
         with cb:
             st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
 
+        exit_reason_breakdown(tdf)
         show_trade_log(tdf, "etf_backtest_trades.csv")
 
 # ════════════════════════════════════════════════════════════
@@ -996,6 +1176,8 @@ with tab2:
          n_start, n_end) = config_panel(
             "n100", NIFTY100_STOCKS, 12, 24, 3, has_target=True
         )
+
+    n_rules = criteria_panel("n100", htf_label="Weekly", has_target=False)
 
     if n_run:
         if not n_syms:
@@ -1021,7 +1203,8 @@ with tab2:
                 tdf, failed = run_nifty100_backtest(
                     sel_stocks, n_fast, n_slow, n_sig,
                     n_cash, n_lev, n_rate, n_target,
-                    start_date=n_start, end_date=n_end
+                    start_date=n_start, end_date=n_end,
+                    **n_rules,
                 )
 
             if tdf.empty:
@@ -1120,12 +1303,5 @@ with tab2:
         with cb:
             st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
 
-        if "exit_reason" in tdf.columns:
-            st.subheader("Exit Reason Breakdown")
-            rc = tdf["exit_reason"].value_counts()
-            r1, r2, r3 = st.columns(3)
-            r1.metric("MACD Crossover Exit", int(rc.get("MACD_EXIT", 0)))
-            r2.metric("Target Hit",           int(rc.get("TARGET",   0)))
-            r3.metric("Still Open (MTM)",     int(rc.get("OPEN",     0)))
-
+        exit_reason_breakdown(tdf)
         show_trade_log(tdf, "nifty100_backtest_trades.csv")
