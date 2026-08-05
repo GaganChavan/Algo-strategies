@@ -401,6 +401,19 @@ def crossed_above(prev_val: float, curr_val: float, level: float) -> bool:
 def crossed_below(prev_val: float, curr_val: float, level: float) -> bool:
     return prev_val >= level and curr_val < level
 
+
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Wilder's Average True Range — same smoothing method as calc_rsi, for
+    consistency. True Range on day i = max(high-low, |high - prev close|,
+    |low - prev close|); ATR is its Wilder-smoothed moving average."""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
 # ─────────────────────────────────────────────────────────────
 # TRANSACTION COSTS  (Zerodha, delivery / MTF)
 # ─────────────────────────────────────────────────────────────
@@ -831,9 +844,10 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                           start_date=None, end_date=None,
                           target_pct=0.05, stop_loss_pct=0.0, trailing_stop_pct=0.0,
                           max_hold_days=0, use_rsi_exit=False, rsi_exit_level=50.0,
-                          use_prev_low_stop=False):
+                          use_prev_low_stop=False,
+                          use_atr_stop=False, atr_period=14, atr_mult=1.5):
     trades = []
-    lookback = max(rsi_period, wr_period, cci_period) + 2
+    lookback = max(rsi_period, wr_period, cci_period, atr_period) + 2
     prog = st.progress(0)
     stat = st.empty()
 
@@ -858,8 +872,9 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
         rsi = calc_rsi(close, rsi_period)
         wr  = calc_williams_r(high, low, close, wr_period)
         cci = calc_cci(high, cci_period)
+        atr = calc_atr(high, low, close, atr_period)
 
-        in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+        in_pos, ep, ed, qty_, peak_p, atr_e = False, 0.0, None, 0, 0.0, 0.0
 
         for i in range(lookback, len(dy) - 1):
             if not in_pos:
@@ -886,6 +901,7 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
 
                 ep, ed, in_pos = float(next_open), dy.index[i + 1], True
                 peak_p = ep
+                atr_e  = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else 0.0
 
             else:
                 curr_close = float(dy["Close"].iloc[i])
@@ -895,6 +911,9 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                 stop_hit   = stop_loss_pct    > 0 and curr_close <= ep     * (1 - stop_loss_pct)
                 target_hit = target_pct        > 0 and curr_close >= ep     * (1 + target_pct)
                 trail_hit  = trailing_stop_pct > 0 and curr_close <= peak_p * (1 - trailing_stop_pct)
+
+                atr_stop_hit = (use_atr_stop and atr_e > 0
+                                and curr_close <= ep - atr_mult * atr_e)
 
                 prev_low_hit = False
                 if use_prev_low_stop and not target_hit:
@@ -909,12 +928,14 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                     if not (pd.isna(r_p) or pd.isna(r_c)):
                         rsi_exit_hit = crossed_below(r_p, r_c, rsi_exit_level)
 
-                if not (stop_hit or target_hit or trail_hit or prev_low_hit or time_hit or rsi_exit_hit):
+                if not (stop_hit or target_hit or trail_hit or atr_stop_hit
+                        or prev_low_hit or time_hit or rsi_exit_hit):
                     continue
 
                 if stop_hit:         exit_reason = "STOP_LOSS"
                 elif target_hit:     exit_reason = "TARGET"
                 elif trail_hit:      exit_reason = "TRAIL_STOP"
+                elif atr_stop_hit:   exit_reason = "ATR_STOP"
                 elif prev_low_hit:   exit_reason = "PREV_LOW_BREAK"
                 elif time_hit:       exit_reason = "TIME_EXIT"
                 else:                exit_reason = "RSI_EXIT"
@@ -937,7 +958,7 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
-                in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+                in_pos, ep, ed, qty_, peak_p, atr_e = False, 0.0, None, 0, 0.0, 0.0
 
         if in_pos:
             xp   = float(dy["Close"].iloc[-1])
@@ -1442,6 +1463,7 @@ EXIT_REASON_LABELS = {
     "TARGET":     "Target Hit",
     "STOP_LOSS":  "Stop Loss",
     "TRAIL_STOP": "Trailing Stop",
+    "ATR_STOP":   "ATR Stop",
     "PREV_LOW_BREAK": "Prev-Day Low Break",
     "TIME_EXIT":  "Time Cap",
     "RSI_EXIT":   "RSI Reversal",
@@ -1859,6 +1881,23 @@ with tab3:
                 help="Dynamic daily stop: if today's low breaks below yesterday's "
                      "low and the target hasn't fired, exit next day's open.",
             )
+            use_atr_stop = st.checkbox(
+                "Also exit on ATR-based stop  (entry − mult × ATR)",
+                value=False, key="scr_use_atr",
+                help="Volatility-adjusted stop: sizes the stop distance to each "
+                     "stock's own average daily range instead of a flat %.",
+            )
+            atr_c1, atr_c2 = st.columns(2)
+            with atr_c1:
+                atr_period = st.number_input(
+                    "ATR Period", value=14, min_value=2, max_value=100,
+                    key="scr_atr_period", disabled=not use_atr_stop,
+                )
+            with atr_c2:
+                atr_mult = st.number_input(
+                    "ATR Multiplier", value=1.5, min_value=0.1, max_value=10.0,
+                    step=0.1, key="scr_atr_mult", disabled=not use_atr_stop,
+                )
         with xc2:
             max_hold = st.number_input(
                 "Max Holding Days  (0 = off)", value=0,
@@ -1878,9 +1917,10 @@ with tab3:
         if not s_syms:
             st.error("Select at least one stock.")
         elif target_pct == 0 and stop_loss == 0 and trailing_stop == 0 \
-                and max_hold == 0 and not use_rsi_exit and not use_prev_low_stop:
+                and max_hold == 0 and not use_rsi_exit and not use_prev_low_stop \
+                and not use_atr_stop:
             st.error("Select at least one exit rule (target / stop / trailing / "
-                     "prev-day low / time cap / RSI reversal).")
+                     "ATR stop / prev-day low / time cap / RSI reversal).")
         else:
             sel_stocks = {k: NIFTY500_STOCKS[k] for k in s_syms}
             total_cap  = s_cash * len(sel_stocks)
@@ -1907,6 +1947,8 @@ with tab3:
                     trailing_stop_pct=trailing_stop, max_hold_days=int(max_hold),
                     use_rsi_exit=use_rsi_exit, rsi_exit_level=rsi_exit_level,
                     use_prev_low_stop=use_prev_low_stop,
+                    use_atr_stop=use_atr_stop, atr_period=int(atr_period),
+                    atr_mult=atr_mult,
                 )
 
             if tdf.empty:
