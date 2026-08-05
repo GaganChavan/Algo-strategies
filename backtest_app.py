@@ -845,9 +845,12 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                           target_pct=0.05, stop_loss_pct=0.0, trailing_stop_pct=0.0,
                           max_hold_days=0, use_rsi_exit=False, rsi_exit_level=50.0,
                           use_prev_low_stop=False,
-                          use_atr_stop=False, atr_period=14, atr_mult=1.5):
+                          use_atr_stop=False, atr_period=14, atr_mult=1.5,
+                          use_atr_trail=False, atr_trail_period=14, atr_trail_mult=3.0,
+                          use_macd_exit=False, macd_fast=12, macd_slow=24, macd_sig=6):
     trades = []
-    lookback = max(rsi_period, wr_period, cci_period, atr_period) + 2
+    lookback = max(rsi_period, wr_period, cci_period, atr_period,
+                   atr_trail_period, macd_slow + macd_sig) + 2
     prog = st.progress(0)
     stat = st.empty()
 
@@ -873,6 +876,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
         wr  = calc_williams_r(high, low, close, wr_period)
         cci = calc_cci(high, cci_period)
         atr = calc_atr(high, low, close, atr_period)
+        atr_trail = calc_atr(high, low, close, atr_trail_period)
+        macd_df = calc_macd(close, macd_fast, macd_slow, macd_sig)
 
         in_pos, ep, ed, qty_, peak_p, atr_e = False, 0.0, None, 0, 0.0, 0.0
 
@@ -915,6 +920,19 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                 atr_stop_hit = (use_atr_stop and atr_e > 0
                                 and curr_close <= ep - atr_mult * atr_e)
 
+                atr_trail_hit = False
+                if use_atr_trail:
+                    curr_atr_trail = atr_trail.iloc[i]
+                    if not pd.isna(curr_atr_trail):
+                        atr_trail_hit = curr_close <= peak_p - atr_trail_mult * float(curr_atr_trail)
+
+                macd_exit_hit = False
+                if use_macd_exit and macd_df is not None:
+                    pm = macd_df["macd"].iloc[i - 1];   ps = macd_df["signal"].iloc[i - 1]
+                    cm = macd_df["macd"].iloc[i];        cs = macd_df["signal"].iloc[i]
+                    if not (pd.isna(pm) or pd.isna(cm)):
+                        macd_exit_hit = pm >= ps and cm < cs
+
                 prev_low_hit = False
                 if use_prev_low_stop and not target_hit:
                     prev_low_hit = float(dy["Low"].iloc[i]) <= float(dy["Low"].iloc[i - 1])
@@ -929,6 +947,7 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                         rsi_exit_hit = crossed_below(r_p, r_c, rsi_exit_level)
 
                 if not (stop_hit or target_hit or trail_hit or atr_stop_hit
+                        or atr_trail_hit or macd_exit_hit
                         or prev_low_hit or time_hit or rsi_exit_hit):
                     continue
 
@@ -936,6 +955,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                 elif target_hit:     exit_reason = "TARGET"
                 elif trail_hit:      exit_reason = "TRAIL_STOP"
                 elif atr_stop_hit:   exit_reason = "ATR_STOP"
+                elif atr_trail_hit:  exit_reason = "ATR_TRAIL"
+                elif macd_exit_hit:  exit_reason = "MACD_EXIT"
                 elif prev_low_hit:   exit_reason = "PREV_LOW_BREAK"
                 elif time_hit:       exit_reason = "TIME_EXIT"
                 else:                exit_reason = "RSI_EXIT"
@@ -1464,6 +1485,7 @@ EXIT_REASON_LABELS = {
     "STOP_LOSS":  "Stop Loss",
     "TRAIL_STOP": "Trailing Stop",
     "ATR_STOP":   "ATR Stop",
+    "ATR_TRAIL":  "ATR Trailing Stop",
     "PREV_LOW_BREAK": "Prev-Day Low Break",
     "TIME_EXIT":  "Time Cap",
     "RSI_EXIT":   "RSI Reversal",
@@ -1912,15 +1934,58 @@ with tab3:
                 min_value=1.0, max_value=99.0, step=1.0,
                 key="scr_rsi_exit_level", disabled=not use_rsi_exit,
             )
+            use_atr_trail = st.checkbox(
+                "Also exit on ATR Trailing Stop  (peak − mult × ATR)",
+                value=False, key="scr_use_atr_trail",
+                help="Chandelier-style stop: trails up as price makes new highs, "
+                     "sized to the stock's own volatility instead of a flat %. "
+                     "Never moves down, only up — lets a real trend run while "
+                     "still cutting losers.",
+            )
+            atrt_c1, atrt_c2 = st.columns(2)
+            with atrt_c1:
+                atr_trail_period = st.number_input(
+                    "ATR Period ", value=14, min_value=2, max_value=100,
+                    key="scr_atr_trail_period", disabled=not use_atr_trail,
+                )
+            with atrt_c2:
+                atr_trail_mult = st.number_input(
+                    "ATR Multiplier ", value=3.0, min_value=0.1, max_value=10.0,
+                    step=0.1, key="scr_atr_trail_mult", disabled=not use_atr_trail,
+                )
+            use_macd_exit = st.checkbox(
+                "Also exit on MACD bearish crossover",
+                value=False, key="scr_use_macd_exit",
+                help="Exit when the daily MACD line crosses below its signal "
+                     "line — a momentum-reversal signal, independent of the "
+                     "entry filter's RSI/Williams %R/CCI.",
+            )
+            macd_c1, macd_c2, macd_c3 = st.columns(3)
+            with macd_c1:
+                macd_fast = st.number_input(
+                    "MACD Fast", value=12, min_value=2, max_value=50,
+                    key="scr_macd_fast", disabled=not use_macd_exit,
+                )
+            with macd_c2:
+                macd_slow = st.number_input(
+                    "MACD Slow", value=24, min_value=5, max_value=200,
+                    key="scr_macd_slow", disabled=not use_macd_exit,
+                )
+            with macd_c3:
+                macd_sig = st.number_input(
+                    "MACD Signal", value=6, min_value=2, max_value=50,
+                    key="scr_macd_sig", disabled=not use_macd_exit,
+                )
 
     if s_run:
         if not s_syms:
             st.error("Select at least one stock.")
         elif target_pct == 0 and stop_loss == 0 and trailing_stop == 0 \
                 and max_hold == 0 and not use_rsi_exit and not use_prev_low_stop \
-                and not use_atr_stop:
+                and not use_atr_stop and not use_atr_trail and not use_macd_exit:
             st.error("Select at least one exit rule (target / stop / trailing / "
-                     "ATR stop / prev-day low / time cap / RSI reversal).")
+                     "ATR stop / ATR trail / MACD reversal / prev-day low / "
+                     "time cap / RSI reversal).")
         else:
             sel_stocks = {k: NIFTY500_STOCKS[k] for k in s_syms}
             total_cap  = s_cash * len(sel_stocks)
@@ -1949,6 +2014,10 @@ with tab3:
                     use_prev_low_stop=use_prev_low_stop,
                     use_atr_stop=use_atr_stop, atr_period=int(atr_period),
                     atr_mult=atr_mult,
+                    use_atr_trail=use_atr_trail, atr_trail_period=int(atr_trail_period),
+                    atr_trail_mult=atr_trail_mult,
+                    use_macd_exit=use_macd_exit, macd_fast=int(macd_fast),
+                    macd_slow=int(macd_slow), macd_sig=int(macd_sig),
                 )
 
             if tdf.empty:
