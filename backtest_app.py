@@ -830,7 +830,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                           cci_period, cci_level, cash, leverage, rate,
                           start_date=None, end_date=None,
                           target_pct=0.05, stop_loss_pct=0.0, trailing_stop_pct=0.0,
-                          max_hold_days=0, use_rsi_exit=False, rsi_exit_level=50.0):
+                          max_hold_days=0, use_rsi_exit=False, rsi_exit_level=50.0,
+                          use_prev_low_stop=False):
     trades = []
     lookback = max(rsi_period, wr_period, cci_period) + 2
     prog = st.progress(0)
@@ -895,6 +896,10 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                 target_hit = target_pct        > 0 and curr_close >= ep     * (1 + target_pct)
                 trail_hit  = trailing_stop_pct > 0 and curr_close <= peak_p * (1 - trailing_stop_pct)
 
+                prev_low_hit = False
+                if use_prev_low_stop and not target_hit:
+                    prev_low_hit = float(dy["Low"].iloc[i]) <= float(dy["Low"].iloc[i - 1])
+
                 days_held = (dy.index[i] - ed).days
                 time_hit  = max_hold_days > 0 and days_held >= max_hold_days
 
@@ -904,12 +909,13 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                     if not (pd.isna(r_p) or pd.isna(r_c)):
                         rsi_exit_hit = crossed_below(r_p, r_c, rsi_exit_level)
 
-                if not (stop_hit or target_hit or trail_hit or time_hit or rsi_exit_hit):
+                if not (stop_hit or target_hit or trail_hit or prev_low_hit or time_hit or rsi_exit_hit):
                     continue
 
                 if stop_hit:         exit_reason = "STOP_LOSS"
                 elif target_hit:     exit_reason = "TARGET"
                 elif trail_hit:      exit_reason = "TRAIL_STOP"
+                elif prev_low_hit:   exit_reason = "PREV_LOW_BREAK"
                 elif time_hit:       exit_reason = "TIME_EXIT"
                 else:                exit_reason = "RSI_EXIT"
 
@@ -1436,6 +1442,7 @@ EXIT_REASON_LABELS = {
     "TARGET":     "Target Hit",
     "STOP_LOSS":  "Stop Loss",
     "TRAIL_STOP": "Trailing Stop",
+    "PREV_LOW_BREAK": "Prev-Day Low Break",
     "TIME_EXIT":  "Time Cap",
     "RSI_EXIT":   "RSI Reversal",
     "OPEN":       "Still Open (MTM)",
@@ -1805,9 +1812,9 @@ with tab3:
 
         with sc3:
             st.markdown("**CCI (on Daily High)**")
-            cci_period = st.number_input("Period  ", value=20, min_value=2, max_value=100,
+            cci_period = st.number_input("Period  ", value=200, min_value=2, max_value=500,
                                          key="scr_cci_period")
-            cci_level  = st.number_input("Crossed-above level  ", value=65.0,
+            cci_level  = st.number_input("Crossed-above level  ", value=100.0,
                                          min_value=-300.0, max_value=300.0, step=5.0,
                                          key="scr_cci_level")
             s_cash = st.number_input("Cash per symbol (₹)", value=10000, step=1000,
@@ -1845,6 +1852,13 @@ with tab3:
                 "Trailing Stop % from peak  (0 = off)", value=0.0,
                 min_value=0.0, max_value=30.0, step=0.5, key="scr_trail",
             ) / 100
+            use_prev_low_stop = st.checkbox(
+                "Also exit if price breaks below previous day's low "
+                "(only when target not yet hit)",
+                value=False, key="scr_use_prev_low",
+                help="Dynamic daily stop: if today's low breaks below yesterday's "
+                     "low and the target hasn't fired, exit next day's open.",
+            )
         with xc2:
             max_hold = st.number_input(
                 "Max Holding Days  (0 = off)", value=0,
@@ -1864,9 +1878,9 @@ with tab3:
         if not s_syms:
             st.error("Select at least one stock.")
         elif target_pct == 0 and stop_loss == 0 and trailing_stop == 0 \
-                and max_hold == 0 and not use_rsi_exit:
+                and max_hold == 0 and not use_rsi_exit and not use_prev_low_stop:
             st.error("Select at least one exit rule (target / stop / trailing / "
-                     "time cap / RSI reversal).")
+                     "prev-day low / time cap / RSI reversal).")
         else:
             sel_stocks = {k: NIFTY500_STOCKS[k] for k in s_syms}
             total_cap  = s_cash * len(sel_stocks)
@@ -1892,6 +1906,7 @@ with tab3:
                     target_pct=target_pct, stop_loss_pct=stop_loss,
                     trailing_stop_pct=trailing_stop, max_hold_days=int(max_hold),
                     use_rsi_exit=use_rsi_exit, rsi_exit_level=rsi_exit_level,
+                    use_prev_low_stop=use_prev_low_stop,
                 )
 
             if tdf.empty:
