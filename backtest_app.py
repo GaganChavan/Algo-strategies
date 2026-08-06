@@ -414,6 +414,33 @@ def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> 
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
+
+def convert_to_heiken_ashi(ohlc: pd.DataFrame) -> pd.DataFrame:
+    """Heikin-Ashi OHLC from a raw daily Open/High/Low/Close frame."""
+    ha = ohlc[["Open", "High", "Low", "Close"]].copy()
+    ha["HA_Close"] = (ha["Open"] + ha["High"] + ha["Low"] + ha["Close"]) / 4
+
+    ha_open = [(ha["Open"].iloc[0] + ha["Close"].iloc[0]) / 2]
+    for i in range(1, len(ha)):
+        ha_open.append((ha_open[i - 1] + ha["HA_Close"].iloc[i - 1]) / 2)
+    ha["HA_Open"] = ha_open
+
+    ha["HA_High"] = ha[["High", "HA_Open", "HA_Close"]].max(axis=1)
+    ha["HA_Low"]  = ha[["Low", "HA_Open", "HA_Close"]].min(axis=1)
+    return ha[["HA_Open", "HA_High", "HA_Low", "HA_Close"]]
+
+
+def calc_pct_from_ath(high: pd.Series, close: pd.Series) -> pd.Series:
+    """% below all-time-high-so-far, as of each day — uses an expanding
+    max (cummax), never the full-series max, so there's no look-ahead:
+    day i only ever sees the ATH known up to day i."""
+    ath_so_far = high.cummax()
+    return (ath_so_far - close) / ath_so_far * 100
+
+
+def calc_roc(close: pd.Series, period: int) -> pd.Series:
+    return (close - close.shift(period)) / close.shift(period) * 100
+
 # ─────────────────────────────────────────────────────────────
 # TRANSACTION COSTS  (Zerodha, delivery / MTF)
 # ─────────────────────────────────────────────────────────────
@@ -1005,6 +1032,202 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
     return pd.DataFrame(trades), failed
 
 # ─────────────────────────────────────────────────────────────
+# N200 HEIKIN-ASHI MACD STRATEGY  (replicates n200_MACD.py's screener)
+# Entry (persistent gates, all must hold the week of entry):
+#   % from all-time-high < pct_ath_max
+#   Monthly HA-MACD(12,24,3) > Signal
+#   Monthly HA-ROC(6) > 0
+#   + weekly HA-MACD(12,24,3) relationship to Signal (configurable trigger)
+#   + optional "Stage 2" acceleration filter (current week's MACD-Signal
+#     gap > 0.85x last week's gap, and last week's gap was already > 0)
+# Exit : Weekly HA-MACD(12,24,3) reverse crossover (configurable),
+#        + optional stop/target/trailing/time-cap
+# Fills always use raw (non-Heikin-Ashi) weekly Open/Close — HA is a
+# signal-smoothing construct, never a tradable price.
+# ─────────────────────────────────────────────────────────────
+
+def run_n200_backtest(stock_dict, cash, leverage, rate,
+                      start_date=None, end_date=None,
+                      pct_ath_max=25.0,
+                      entry_trigger="crossover", use_stage2=False,
+                      exit_trigger="crossover",
+                      target_pct=0.0, stop_loss_pct=0.0, trailing_stop_pct=0.0,
+                      max_hold_days=0):
+    trades, failed = [], []
+    lookback = 24 + 3 + 2   # weekly MACD(12,24,3) warm-up
+    prog = st.progress(0)
+    stat = st.empty()
+
+    ohlc_map, failed = fetch_screener_universe(stock_dict, prog=prog, stat=stat)
+
+    stat.text(f"Fetched {len(ohlc_map)}/{len(stock_dict)} symbols — running backtest...")
+
+    for sym, dy in ohlc_map.items():
+        if start_date is not None:
+            dy = dy[dy.index >= start_date]
+        if end_date is not None:
+            dy = dy[dy.index <= end_date]
+
+        if len(dy) < 100:
+            failed.append(sym)
+            continue
+
+        pct_ath_daily = calc_pct_from_ath(dy["High"], dy["Close"])
+        pct_ath_wk = pct_ath_daily.resample("W-FRI").last().dropna()
+
+        wk_raw = dy.resample("W-FRI").agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        ).dropna()
+
+        ha = convert_to_heiken_ashi(dy)
+        wk_ha = ha.resample("W-FRI").agg(
+            {"HA_Open": "first", "HA_High": "max", "HA_Low": "min", "HA_Close": "last"}
+        ).dropna()
+        mo_ha = ha.resample("ME").agg(
+            {"HA_Open": "first", "HA_High": "max", "HA_Low": "min", "HA_Close": "last"}
+        ).dropna()
+
+        if len(wk_raw) < lookback + 2 or len(wk_ha) < lookback + 2:
+            failed.append(sym)
+            continue
+
+        wk_m = calc_macd(wk_ha["HA_Close"], 12, 24, 3)
+        mo_m = calc_macd(mo_ha["HA_Close"], 12, 24, 3)
+        mo_roc = calc_roc(mo_ha["HA_Close"], 6)
+        if wk_m is None or mo_m is None:
+            failed.append(sym)
+            continue
+
+        in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+
+        for i in range(lookback, len(wk_raw) - 1):
+            w_date = wk_raw.index[i]
+
+            if not in_pos:
+                # Persistent monthly gates, as-of the latest completed month
+                mo_slice = mo_m[mo_m.index <= w_date]
+                if len(mo_slice) < 2:
+                    continue
+                if mo_slice["macd"].iloc[-1] <= mo_slice["signal"].iloc[-1]:
+                    continue
+
+                roc_slice = mo_roc[mo_roc.index <= w_date].dropna()
+                if len(roc_slice) < 1 or float(roc_slice.iloc[-1]) <= 0:
+                    continue
+
+                # Persistent %-from-ATH gate (weekly-aligned to the same index as wk_raw)
+                if i >= len(pct_ath_wk) or pd.isna(pct_ath_wk.iloc[i]) \
+                        or float(pct_ath_wk.iloc[i]) >= pct_ath_max:
+                    continue
+
+                # Weekly HA-MACD entry trigger (configurable)
+                pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
+                cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
+                if pd.isna(pm) or pd.isna(cm):
+                    continue
+                if entry_trigger == "crossover":
+                    entry_ok = pm <= ps and cm > cs
+                elif entry_trigger == "above_signal":
+                    entry_ok = cm > cs
+                else:  # above_zero
+                    entry_ok = pm <= 0 and cm > 0
+                if not entry_ok:
+                    continue
+
+                # Optional Stage 2: weekly gap still expanding, was already positive
+                if use_stage2:
+                    prev_gap = pm - ps
+                    curr_gap = cm - cs
+                    if not (curr_gap > 0.85 * prev_gap and prev_gap > 0):
+                        continue
+
+                next_open = wk_raw["Open"].iloc[i + 1]
+                if pd.isna(next_open) or float(next_open) <= 0:
+                    continue
+
+                qty_ = int((cash * leverage) // float(next_open))
+                if qty_ <= 0:
+                    continue
+
+                ep, ed, in_pos = float(next_open), wk_raw.index[i + 1], True
+                peak_p = ep
+
+            else:
+                curr_close = float(wk_raw["Close"].iloc[i])
+                if curr_close > peak_p:
+                    peak_p = curr_close
+
+                stop_hit   = stop_loss_pct    > 0 and curr_close <= ep     * (1 - stop_loss_pct)
+                target_hit = target_pct        > 0 and curr_close >= ep     * (1 + target_pct)
+                trail_hit  = trailing_stop_pct > 0 and curr_close <= peak_p * (1 - trailing_stop_pct)
+
+                days_held = (wk_raw.index[i] - ed).days
+                time_hit  = max_hold_days > 0 and days_held >= max_hold_days
+
+                pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
+                cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
+                if pd.isna(pm) or pd.isna(cm):
+                    macd_exit = False
+                elif exit_trigger == "crossover":
+                    macd_exit = pm >= ps and cm < cs
+                elif exit_trigger == "below_signal":
+                    macd_exit = cm < cs
+                else:  # below_zero
+                    macd_exit = pm >= 0 and cm < 0
+
+                if not (stop_hit or target_hit or trail_hit or time_hit or macd_exit):
+                    continue
+
+                if stop_hit:       exit_reason = "STOP_LOSS"
+                elif target_hit:   exit_reason = "TARGET"
+                elif trail_hit:    exit_reason = "TRAIL_STOP"
+                elif time_hit:     exit_reason = "TIME_EXIT"
+                else:              exit_reason = "MACD_EXIT"
+
+                xp   = float(wk_raw["Open"].iloc[i + 1])
+                xd   = wk_raw.index[i + 1]
+                days = max((xd - ed).days, 1)
+                gp   = (xp - ep) * qty_
+                cst  = txn_costs(qty_, ep, xp)
+                mti  = mtf_cost(ep, qty_, leverage, days, rate)
+                np_  = gp - cst - mti
+                cash_used = ep * qty_ / leverage
+
+                trades.append(dict(
+                    symbol=sym, entry_date=ed, exit_date=xd,
+                    entry_price=round(ep, 2), exit_price=round(xp, 2),
+                    qty=qty_, holding_days=days, exit_reason=exit_reason,
+                    gross_pnl=round(gp, 2), costs=round(cst, 2),
+                    mtf_interest=round(mti, 2), net_pnl=round(np_, 2),
+                    return_pct=round(np_ / cash_used * 100, 2),
+                    status="CLOSED",
+                ))
+                in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+
+        if in_pos:
+            xp   = float(wk_raw["Close"].iloc[-1])
+            xd   = wk_raw.index[-1]
+            days = max((xd - ed).days, 1)
+            gp   = (xp - ep) * qty_
+            cst  = txn_costs(qty_, ep, xp)
+            mti  = mtf_cost(ep, qty_, leverage, days, rate)
+            np_  = gp - cst - mti
+            cash_used = ep * qty_ / leverage
+            trades.append(dict(
+                symbol=sym, entry_date=ed, exit_date=xd,
+                entry_price=round(ep, 2), exit_price=round(xp, 2),
+                qty=qty_, holding_days=days, exit_reason="OPEN",
+                gross_pnl=round(gp, 2), costs=round(cst, 2),
+                mtf_interest=round(mti, 2), net_pnl=round(np_, 2),
+                return_pct=round(np_ / cash_used * 100, 2),
+                status="OPEN (MTM)",
+            ))
+
+    prog.empty()
+    stat.empty()
+    return pd.DataFrame(trades), failed
+
+# ─────────────────────────────────────────────────────────────
 # EQUITY CURVE  (daily, using business-day calendar)
 # ─────────────────────────────────────────────────────────────
 
@@ -1508,8 +1731,9 @@ def exit_reason_breakdown(tdf: pd.DataFrame):
 # MAIN TABS
 # ─────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(
-    ["📊 ETF Strategy", "📈 Nifty 100 Strategy", "🎯 Nifty 500 Momentum Screener"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📊 ETF Strategy", "📈 Nifty 100 Strategy", "🎯 Nifty 500 Momentum Screener",
+     "🕯️ N200 Heikin-Ashi MACD"]
 )
 
 # ════════════════════════════════════════════════════════════
@@ -2107,3 +2331,234 @@ with tab3:
 
         exit_reason_breakdown(tdf)
         show_trade_log(tdf, "nifty500_screener_backtest_trades.csv")
+
+# ════════════════════════════════════════════════════════════
+# TAB 4 — N200 HEIKIN-ASHI MACD STRATEGY
+# ════════════════════════════════════════════════════════════
+
+with tab4:
+    st.subheader("N200 Heikin-Ashi MACD — Monthly Filter + Weekly Trigger")
+    st.caption(
+        "Replicates n200_MACD.py's screener as a backtest. Entry (persistent): "
+        "% from ATH below threshold, Monthly HA-MACD(12,24,3) > Signal, Monthly "
+        "HA-ROC(6) > 0  **AND**  Weekly HA-MACD(12,24,3) trigger (configurable)  →  "
+        "enter next week's open  |  "
+        "Exit: Weekly HA-MACD(12,24,3) reverse crossover (configurable)  →  "
+        "exit next week's open. Signals are computed on Heikin-Ashi candles; "
+        "actual entry/exit fills always use raw (non-HA) prices."
+    )
+
+    with st.expander("⚙️ Configure & Run", expanded=True):
+        n2c1, n2c2, n2c3 = st.columns([2, 1, 1])
+
+        with n2c1:
+            n2_syms = st.multiselect(
+                "Select symbols  (universe: Nifty 500 list)",
+                options=list(NIFTY500_STOCKS.keys()),
+                default=list(NIFTY500_STOCKS.keys()), key="n2_symbols",
+            )
+            n2dcol1, n2dcol2 = st.columns(2)
+            with n2dcol1:
+                from datetime import date as date_type
+                n2_start = st.date_input(
+                    "Backtest from", value=date_type(2015, 1, 1),
+                    min_value=date_type(2000, 1, 1), max_value=date_type.today(),
+                    key="n2_start",
+                )
+            with n2dcol2:
+                n2_end = st.date_input(
+                    "Backtest to", value=date_type.today(),
+                    min_value=date_type(2000, 1, 1), max_value=date_type.today(),
+                    key="n2_end",
+                )
+
+        with n2c2:
+            n2_pct_ath = st.number_input(
+                "Max % from ATH  (entry gate)", value=25.0,
+                min_value=1.0, max_value=100.0, step=1.0, key="n2_pct_ath",
+            )
+            n2_entry_trig = st.selectbox(
+                "Weekly entry trigger", key="n2_entry_trig",
+                options=["crossover", "above_signal", "above_zero"],
+                format_func=lambda x: {
+                    "crossover":    "MACD crosses above Signal ↑  (default)",
+                    "above_signal": "MACD already > Signal  (no crossover needed)",
+                    "above_zero":   "MACD crosses above Zero line",
+                }[x],
+            )
+            n2_stage2 = st.checkbox(
+                "Also require Stage-2 acceleration filter",
+                value=False, key="n2_stage2",
+                help="Matches n200_MACD.py's 'Ready for Ranking' check: this "
+                     "week's MACD-Signal gap > 85% of last week's gap, AND "
+                     "last week's gap was already positive (two consecutive "
+                     "bullish weeks, not just one).",
+            )
+
+        with n2c3:
+            n2_cash = st.number_input("Cash per symbol (₹)", value=10000, step=1000,
+                                      key="n2_cash")
+            n2_lev = st.selectbox(
+                "Leverage", [1, 2, 3, 4, 5], index=0,
+                format_func=lambda x: f"{x}x  ({'CNC' if x == 1 else 'MTF'})",
+                key="n2_lev",
+            )
+            n2_rate = st.number_input("MTF rate (% p.a.)", value=14.0,
+                                      min_value=0.0, max_value=30.0, step=0.5,
+                                      key="n2_rate") / 100
+
+        n2_run = st.button("🚀 Run Backtest", type="primary",
+                           use_container_width=True, key="n2_run")
+
+    with st.expander("🎯 Exit Rules", expanded=False):
+        st.caption(
+            "Weekly MACD reverse crossover is the primary exit (as requested). "
+            "The extras below are optional — combine as many as you like."
+        )
+        n2xc1, n2xc2 = st.columns(2)
+        with n2xc1:
+            n2_exit_trig = st.selectbox(
+                "Weekly MACD exit trigger", key="n2_exit_trig",
+                options=["crossover", "below_signal", "below_zero"],
+                format_func=lambda x: {
+                    "crossover":    "MACD crosses below Signal ↓  (default)",
+                    "below_signal": "MACD already < Signal  (no crossover needed)",
+                    "below_zero":   "MACD crosses below Zero line  (stay longer)",
+                }[x],
+            )
+            n2_target = st.number_input(
+                "Target % from entry  (0 = off)", value=0.0,
+                min_value=0.0, max_value=100.0, step=0.5, key="n2_target",
+            ) / 100
+        with n2xc2:
+            n2_stop = st.number_input(
+                "Stop Loss % from entry  (0 = off)", value=0.0,
+                min_value=0.0, max_value=50.0, step=0.5, key="n2_stop",
+            ) / 100
+            n2_trail = st.number_input(
+                "Trailing Stop % from peak  (0 = off)", value=0.0,
+                min_value=0.0, max_value=30.0, step=0.5, key="n2_trail",
+            ) / 100
+            n2_maxhold = st.number_input(
+                "Max Holding Days  (0 = off)", value=0,
+                min_value=0, max_value=730, step=1, key="n2_maxhold",
+            )
+
+    if n2_run:
+        if not n2_syms:
+            st.error("Select at least one stock.")
+        else:
+            sel_stocks = {k: NIFTY500_STOCKS[k] for k in n2_syms}
+            total_cap  = n2_cash * len(sel_stocks)
+
+            st.info(
+                f"Running on **{len(sel_stocks)} stocks** | "
+                f"₹{n2_cash:,} × {n2_lev}x = ₹{n2_cash * n2_lev:,} per stock | "
+                f"Total capital: ₹{total_cap:,} | "
+                f"Period: **{n2_start} → {n2_end}**"
+            )
+            if len(sel_stocks) > 50:
+                st.warning(
+                    f"Fetching {len(sel_stocks)} stocks can take several minutes on "
+                    "the first run. Data is cached — subsequent runs with different "
+                    "parameters are instant."
+                )
+
+            with st.spinner("Fetching data & running backtest..."):
+                tdf, failed = run_n200_backtest(
+                    sel_stocks, n2_cash, int(n2_lev), n2_rate,
+                    start_date=pd.Timestamp(n2_start), end_date=pd.Timestamp(n2_end),
+                    pct_ath_max=n2_pct_ath,
+                    entry_trigger=n2_entry_trig, use_stage2=n2_stage2,
+                    exit_trigger=n2_exit_trig,
+                    target_pct=n2_target, stop_loss_pct=n2_stop,
+                    trailing_stop_pct=n2_trail, max_hold_days=int(n2_maxhold),
+                )
+
+            if tdf.empty:
+                st.error("No trades generated. Try adjusting thresholds, exit rules, "
+                         "or the date range.")
+            else:
+                equity  = build_equity_curve(tdf, total_cap)
+                metrics = compute_metrics(tdf, equity, total_cap)
+                st.session_state["n200_results"] = dict(
+                    tdf=tdf, equity=equity, metrics=metrics, failed=failed,
+                    total_cap=total_cap, sel_stocks=sel_stocks,
+                    n2_start=pd.Timestamp(n2_start), n2_end=pd.Timestamp(n2_end),
+                )
+
+    if "n200_results" in st.session_state:
+        r          = st.session_state["n200_results"]
+        tdf        = r["tdf"]
+        equity     = r["equity"]
+        metrics    = r["metrics"]
+        failed     = r["failed"]
+        total_cap  = r["total_cap"]
+        sel_stocks = r["sel_stocks"]
+        n2_start_r = r["n2_start"]
+        n2_end_r   = r["n2_end"]
+
+        n50 = fetch_nifty50()
+        bnh = buy_and_hold_series(sel_stocks, "1d", start_date=equity.index[0])
+
+        if failed:
+            st.warning(f"⚠️ No data for: {', '.join(failed)}")
+
+        first_trade  = tdf["entry_date"].min().date()
+        last_trade   = tdf["exit_date"].max().date()
+        years_tested = (tdf["exit_date"].max() - tdf["entry_date"].min()).days / 365.25
+        st.success(
+            f"📅 **Configured:** {n2_start_r.date()} → {n2_end_r.date()}  |  "
+            f"**First actual trade:** {first_trade}  |  "
+            f"**Last actual trade:** {last_trade}  ({years_tested:.1f} years)"
+        )
+
+        with st.expander("📊 Per-symbol data range"):
+            sym_summary = (
+                tdf.groupby("symbol")
+                .agg(first_trade=("entry_date", "min"),
+                     last_trade=("exit_date", "max"),
+                     num_trades=("net_pnl", "count"),
+                     net_pnl=("net_pnl", "sum"))
+                .reset_index()
+                .sort_values("first_trade")
+            )
+            sym_summary["first_trade"] = sym_summary["first_trade"].dt.date
+            sym_summary["last_trade"]  = sym_summary["last_trade"].dt.date
+            sym_summary["net_pnl"]     = sym_summary["net_pnl"].map("₹{:,.0f}".format)
+            st.dataframe(sym_summary, use_container_width=True)
+
+        show_metrics(metrics, "N200 Heikin-Ashi MACD Strategy")
+        st.plotly_chart(
+            equity_chart(equity, n50, bnh,
+                         "N200 Heikin-Ashi MACD — Equity Curve vs Benchmarks"),
+            use_container_width=True,
+        )
+        st.plotly_chart(drawdown_chart(equity), use_container_width=True)
+
+        st.plotly_chart(
+            market_exposure_chart(tdf, equity),
+            use_container_width=True,
+        )
+
+        with st.expander("📅 Strategy Deployment Timeline (per stock)"):
+            st.caption(
+                "Green = profitable trade in progress | "
+                "Red = losing trade in progress | "
+                "Gap = idle (no position)"
+            )
+            st.plotly_chart(
+                deployment_timeline_chart(
+                    tdf, "N200 Heikin-Ashi MACD — Deployed vs Idle Periods per Symbol"
+                ),
+                use_container_width=True,
+            )
+
+        ca2, cb2 = st.columns(2)
+        with ca2:
+            st.plotly_chart(pnl_dist_chart(tdf), use_container_width=True)
+        with cb2:
+            st.plotly_chart(per_symbol_chart(tdf), use_container_width=True)
+
+        exit_reason_breakdown(tdf)
+        show_trade_log(tdf, "n200_ha_macd_backtest_trades.csv")
