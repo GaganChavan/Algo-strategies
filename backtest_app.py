@@ -1247,11 +1247,24 @@ N200_SIGNAL_TAB  = "N200 Backtest Signals"
 N200_TRADES_TAB  = "N200 Backtest Trades"
 
 
-def _open_n200_sheet(tab_name: str, cols: int = 10):
+def _get_gspread_client():
+    """Local runs use the JSON key file on disk. The deployed app has no
+    access to that file (it's on the developer's own Mac), so on Streamlit
+    Cloud this instead reads the same key from st.secrets — configured
+    once via the app's Settings → Secrets panel — falling back to the
+    local file only when no such secret is configured."""
     scope = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_file(N200_CREDS_PATH, scopes=scope)
-    client = gspread.authorize(creds)
+    if "gcp_service_account" in st.secrets:
+        creds = Credentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]), scopes=scope)
+    else:
+        creds = Credentials.from_service_account_file(N200_CREDS_PATH, scopes=scope)
+    return gspread.authorize(creds)
+
+
+def _open_n200_sheet(tab_name: str, cols: int = 10):
+    client = _get_gspread_client()
     spreadsheet = client.open(N200_SHEET_NAME)
 
     existing_ws = [ws.title for ws in spreadsheet.worksheets()]
