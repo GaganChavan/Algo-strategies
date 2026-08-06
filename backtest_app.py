@@ -16,6 +16,9 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
+from google.oauth2.service_account import Credentials
+import gspread
+import gspread.utils
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -1033,13 +1036,15 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
 
 # ─────────────────────────────────────────────────────────────
 # N200 HEIKIN-ASHI MACD STRATEGY  (replicates n200_MACD.py's screener)
-# Entry (persistent gates, all must hold the week of entry):
-#   % from all-time-high < pct_ath_max
-#   Monthly HA-MACD(12,24,3) > Signal
-#   Monthly HA-ROC(6) > 0
-#   + weekly HA-MACD(12,24,3) relationship to Signal (configurable trigger)
-#   + optional "Stage 2" acceleration filter (current week's MACD-Signal
-#     gap > 0.85x last week's gap, and last week's gap was already > 0)
+# Entry — Stage 1 (Consider) AND Stage 2 (Ready for Ranking) must BOTH
+# confirm together, every time, exactly matching the real trading
+# process (no separate/optional trigger — entering on Stage 1 alone
+# was a bug in the first version of this engine):
+#   Stage 1: % from ATH < pct_ath_max, Monthly HA-MACD(12,24,3) > Signal,
+#            Monthly HA-ROC(6) > 0, Weekly HA-MACD(12,24,3) > Signal
+#   Stage 2: this week's weekly MACD-Signal gap > 0.85x last week's gap,
+#            AND last week's gap was already > 0 (sustained 2+ weeks,
+#            not a one-week blip)
 # Exit : Weekly HA-MACD(12,24,3) reverse crossover (configurable),
 #        + optional stop/target/trailing/time-cap
 # Fills always use raw (non-Heikin-Ashi) weekly Open/Close — HA is a
@@ -1049,11 +1054,13 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
 def run_n200_backtest(stock_dict, cash, leverage, rate,
                       start_date=None, end_date=None,
                       pct_ath_max=25.0,
-                      entry_trigger="crossover", use_stage2=False,
                       exit_trigger="crossover",
                       target_pct=0.0, stop_loss_pct=0.0, trailing_stop_pct=0.0,
-                      max_hold_days=0):
+                      max_hold_days=0,
+                      collect_signals=False):
     trades, failed = [], []
+    signals = []   # every week Stage 1 + Stage 2 both confirm, whether or
+                    # not a trade was actually taken that week (audit log)
     lookback = 24 + 3 + 2   # weekly MACD(12,24,3) warm-up
     prog = st.progress(0)
     stat = st.empty()
@@ -1103,43 +1110,44 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
         for i in range(lookback, len(wk_raw) - 1):
             w_date = wk_raw.index[i]
 
+            # ── Evaluate Stage 1 + Stage 2 for THIS week, regardless of
+            #    in_pos, so the audit log captures every historical signal
+            #    even for weeks the backtest happened to already be holding
+            #    a position from an earlier entry. ──
+            mo_slice  = mo_m[mo_m.index <= w_date]
+            roc_slice = mo_roc[mo_roc.index <= w_date].dropna()
+            pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
+            cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
+
+            stage1_ok = (
+                len(mo_slice) >= 2 and len(roc_slice) >= 1
+                and not pd.isna(pm) and not pd.isna(cm)
+                and i < len(pct_ath_wk) and not pd.isna(pct_ath_wk.iloc[i])
+                and mo_slice["macd"].iloc[-1] > mo_slice["signal"].iloc[-1]
+                and float(roc_slice.iloc[-1]) > 0
+                and float(pct_ath_wk.iloc[i]) < pct_ath_max
+                and cm > cs
+            )
+            stage2_ok = False
+            if stage1_ok:
+                prev_gap = pm - ps
+                curr_gap = cm - cs
+                stage2_ok = curr_gap > 0.85 * prev_gap and prev_gap > 0
+
+            if collect_signals and stage1_ok and stage2_ok:
+                signals.append(dict(
+                    symbol=sym, week=w_date,
+                    monthly_macd=round(float(mo_slice["macd"].iloc[-1]), 4),
+                    monthly_signal=round(float(mo_slice["signal"].iloc[-1]), 4),
+                    monthly_roc=round(float(roc_slice.iloc[-1]), 2),
+                    pct_from_ath=round(float(pct_ath_wk.iloc[i]), 2),
+                    weekly_macd=round(float(cm), 4),
+                    weekly_signal=round(float(cs), 4),
+                ))
+
             if not in_pos:
-                # Persistent monthly gates, as-of the latest completed month
-                mo_slice = mo_m[mo_m.index <= w_date]
-                if len(mo_slice) < 2:
+                if not (stage1_ok and stage2_ok):
                     continue
-                if mo_slice["macd"].iloc[-1] <= mo_slice["signal"].iloc[-1]:
-                    continue
-
-                roc_slice = mo_roc[mo_roc.index <= w_date].dropna()
-                if len(roc_slice) < 1 or float(roc_slice.iloc[-1]) <= 0:
-                    continue
-
-                # Persistent %-from-ATH gate (weekly-aligned to the same index as wk_raw)
-                if i >= len(pct_ath_wk) or pd.isna(pct_ath_wk.iloc[i]) \
-                        or float(pct_ath_wk.iloc[i]) >= pct_ath_max:
-                    continue
-
-                # Weekly HA-MACD entry trigger (configurable)
-                pm = wk_m["macd"].iloc[i - 1];   ps = wk_m["signal"].iloc[i - 1]
-                cm = wk_m["macd"].iloc[i];        cs = wk_m["signal"].iloc[i]
-                if pd.isna(pm) or pd.isna(cm):
-                    continue
-                if entry_trigger == "crossover":
-                    entry_ok = pm <= ps and cm > cs
-                elif entry_trigger == "above_signal":
-                    entry_ok = cm > cs
-                else:  # above_zero
-                    entry_ok = pm <= 0 and cm > 0
-                if not entry_ok:
-                    continue
-
-                # Optional Stage 2: weekly gap still expanding, was already positive
-                if use_stage2:
-                    prev_gap = pm - ps
-                    curr_gap = cm - cs
-                    if not (curr_gap > 0.85 * prev_gap and prev_gap > 0):
-                        continue
 
                 next_open = wk_raw["Open"].iloc[i + 1]
                 if pd.isna(next_open) or float(next_open) <= 0:
@@ -1225,7 +1233,53 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
 
     prog.empty()
     stat.empty()
-    return pd.DataFrame(trades), failed
+    return pd.DataFrame(trades), failed, signals
+
+# ─────────────────────────────────────────────────────────────
+# GOOGLE SHEETS — N200 "Ready for Ranking" signal audit log
+# Same spreadsheet n200_macd.py writes its live scans to, so backtest
+# history and live signals live side by side.
+# ─────────────────────────────────────────────────────────────
+
+N200_CREDS_PATH  = r'/Users/gagankumarchavan/Documents/API Cred/noble-aquifer-437514-k4-a50658fe7247.json'
+N200_SHEET_NAME  = "Momentum Watch list - Harish"
+N200_SIGNAL_TAB  = "N200 Backtest Signals"
+
+
+def log_signals_to_sheet(signals: list):
+    """Append every Stage-1+Stage-2 signal from a backtest run to a
+    dedicated audit-log tab. Returns (rows_written, error_message)."""
+    if not signals:
+        return 0, None
+    try:
+        scope = ["https://spreadsheets.google.com/feeds",
+                 "https://www.googleapis.com/auth/drive"]
+        creds  = Credentials.from_service_account_file(N200_CREDS_PATH, scopes=scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open(N200_SHEET_NAME)
+
+        existing_ws = [ws.title for ws in spreadsheet.worksheets()]
+        if N200_SIGNAL_TAB not in existing_ws:
+            spreadsheet.add_worksheet(title=N200_SIGNAL_TAB, rows=200, cols=10)
+        sheet = spreadsheet.worksheet(N200_SIGNAL_TAB)
+
+        header = ["Symbol", "Week", "Monthly MACD", "Monthly Signal",
+                  "Monthly ROC", "% from ATH", "Weekly MACD", "Weekly Signal"]
+        if sheet.row_values(1) != header:
+            sheet.update(range_name="A1", values=[header])
+
+        rows = [[
+            s["symbol"], s["week"].date().isoformat(), s["monthly_macd"],
+            s["monthly_signal"], s["monthly_roc"], s["pct_from_ath"],
+            s["weekly_macd"], s["weekly_signal"],
+        ] for s in signals]
+
+        chunk = 500
+        for i in range(0, len(rows), chunk):
+            sheet.append_rows(rows[i:i + chunk], value_input_option="USER_ENTERED")
+        return len(rows), None
+    except Exception as e:
+        return 0, str(e)
 
 # ─────────────────────────────────────────────────────────────
 # EQUITY CURVE  (daily, using business-day calendar)
@@ -2339,10 +2393,13 @@ with tab3:
 with tab4:
     st.subheader("N200 Heikin-Ashi MACD — Monthly Filter + Weekly Trigger")
     st.caption(
-        "Replicates n200_MACD.py's screener as a backtest. Entry (persistent): "
-        "% from ATH below threshold, Monthly HA-MACD(12,24,3) > Signal, Monthly "
-        "HA-ROC(6) > 0  **AND**  Weekly HA-MACD(12,24,3) trigger (configurable)  →  "
-        "enter next week's open  |  "
+        "Replicates n200_MACD.py's screener as a backtest. Entry requires "
+        "**Stage 1 (Consider)** — % from ATH below threshold, Monthly HA-MACD(12,24,3) "
+        "> Signal, Monthly HA-ROC(6) > 0, Weekly HA-MACD(12,24,3) > Signal — "
+        "**AND Stage 2 (Ready for Ranking)** — this week's weekly MACD-Signal gap "
+        "> 85% of last week's gap, with last week's gap already positive — "
+        "**both together, always**, matching the real trading process  →  enter "
+        "next week's open  |  "
         "Exit: Weekly HA-MACD(12,24,3) reverse crossover (configurable)  →  "
         "exit next week's open. Signals are computed on Heikin-Ashi candles; "
         "actual entry/exit fills always use raw (non-HA) prices."
@@ -2377,22 +2434,19 @@ with tab4:
                 "Max % from ATH  (entry gate)", value=25.0,
                 min_value=1.0, max_value=100.0, step=1.0, key="n2_pct_ath",
             )
-            n2_entry_trig = st.selectbox(
-                "Weekly entry trigger", key="n2_entry_trig",
-                options=["crossover", "above_signal", "above_zero"],
-                format_func=lambda x: {
-                    "crossover":    "MACD crosses above Signal ↑  (default)",
-                    "above_signal": "MACD already > Signal  (no crossover needed)",
-                    "above_zero":   "MACD crosses above Zero line",
-                }[x],
+            st.caption(
+                "Entry always requires Stage 1 **and** Stage 2 together "
+                "(not configurable — this matches how you actually trade "
+                "it, so it can't be misconfigured into a dead combination)."
             )
-            n2_stage2 = st.checkbox(
-                "Also require Stage-2 acceleration filter",
-                value=False, key="n2_stage2",
-                help="Matches n200_MACD.py's 'Ready for Ranking' check: this "
-                     "week's MACD-Signal gap > 85% of last week's gap, AND "
-                     "last week's gap was already positive (two consecutive "
-                     "bullish weeks, not just one).",
+            n2_log_signals = st.checkbox(
+                "Log every Ready-for-Ranking signal to Google Sheets",
+                value=False, key="n2_log_signals",
+                help="Writes every historical week Stage 1 + Stage 2 both "
+                     "confirmed (whether or not a trade was taken that "
+                     "week) to the 'N200 Backtest Signals' tab in the "
+                     "'Momentum Watch list - Harish' spreadsheet — an "
+                     "audit trail independent of the trade log below.",
             )
 
         with n2c3:
@@ -2465,15 +2519,28 @@ with tab4:
                 )
 
             with st.spinner("Fetching data & running backtest..."):
-                tdf, failed = run_n200_backtest(
+                tdf, failed, signals = run_n200_backtest(
                     sel_stocks, n2_cash, int(n2_lev), n2_rate,
                     start_date=pd.Timestamp(n2_start), end_date=pd.Timestamp(n2_end),
                     pct_ath_max=n2_pct_ath,
-                    entry_trigger=n2_entry_trig, use_stage2=n2_stage2,
                     exit_trigger=n2_exit_trig,
                     target_pct=n2_target, stop_loss_pct=n2_stop,
                     trailing_stop_pct=n2_trail, max_hold_days=int(n2_maxhold),
+                    collect_signals=n2_log_signals,
                 )
+
+            if n2_log_signals:
+                with st.spinner(f"Writing {len(signals)} signal(s) to Google Sheets..."):
+                    n_written, sheet_err = log_signals_to_sheet(signals)
+                if sheet_err:
+                    st.warning(f"⚠️ Could not write signal log to Google Sheets: {sheet_err}")
+                elif n_written:
+                    st.success(
+                        f"📤 Logged {n_written} historical signal(s) to "
+                        f"'{N200_SIGNAL_TAB}' in '{N200_SHEET_NAME}'."
+                    )
+                else:
+                    st.info("No Stage 1 + Stage 2 signals found to log for this run.")
 
             if tdf.empty:
                 st.error("No trades generated. Try adjusting thresholds, exit rules, "
