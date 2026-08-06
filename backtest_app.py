@@ -484,7 +484,8 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
                      start_date=None, end_date=None,
                      use_htf_filter=True, entry_trigger="crossover",
                      exit_trigger="crossover", sma_period=0,
-                     stop_loss_pct=0.0, target_pct=0.0, trailing_stop_pct=0.0):
+                     stop_loss_pct=0.0, target_pct=0.0, trailing_stop_pct=0.0,
+                     compound=False):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -519,6 +520,7 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
             continue
 
         in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+        sym_equity = cash   # compounds via realized net_pnl when compound=True
 
         for i in range(lookback, len(wk) - 1):
             w_date = wk.index[i]
@@ -556,7 +558,8 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
                 if pd.isna(next_open) or float(next_open) <= 0:
                     continue
 
-                qty_ = int((cash * leverage) // float(next_open))
+                alloc = sym_equity if compound else cash
+                qty_ = int((alloc * leverage) // float(next_open))
                 if qty_ <= 0:
                     continue
 
@@ -613,6 +616,8 @@ def run_etf_backtest(etf_dict, fast, slow, sig_p, cash, leverage, rate,
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
+                if compound:
+                    sym_equity += np_
                 in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         if in_pos:
@@ -653,7 +658,8 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                           start_date=None, end_date=None,
                           use_htf_filter=True, entry_trigger="crossover",
                           exit_trigger="crossover", sma_period=0,
-                          stop_loss_pct=0.0, trailing_stop_pct=0.0):
+                          stop_loss_pct=0.0, trailing_stop_pct=0.0,
+                          compound=False):
     trades, failed = [], []
     lookback = slow + sig_p + 2
     prog = st.progress(0)
@@ -688,6 +694,7 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
             continue
 
         in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+        sym_equity = cash   # compounds via realized net_pnl when compound=True
 
         for i in range(lookback, len(dy) - 1):
             d_date = dy.index[i]
@@ -725,7 +732,8 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                 if pd.isna(next_open) or float(next_open) <= 0:
                     continue
 
-                qty_ = int((cash * leverage) // float(next_open))
+                alloc = sym_equity if compound else cash
+                qty_ = int((alloc * leverage) // float(next_open))
                 if qty_ <= 0:
                     continue
 
@@ -782,6 +790,8 @@ def run_nifty100_backtest(stock_dict, fast, slow, sig_p, cash,
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
+                if compound:
+                    sym_equity += np_
                 in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         if in_pos:
@@ -877,7 +887,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                           use_prev_low_stop=False,
                           use_atr_stop=False, atr_period=14, atr_mult=1.5,
                           use_atr_trail=False, atr_trail_period=14, atr_trail_mult=3.0,
-                          use_macd_exit=False, macd_fast=12, macd_slow=24, macd_sig=6):
+                          use_macd_exit=False, macd_fast=12, macd_slow=24, macd_sig=6,
+                          compound=False):
     trades = []
     lookback = max(rsi_period, wr_period, cci_period, atr_period,
                    atr_trail_period, macd_slow + macd_sig) + 2
@@ -910,6 +921,7 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
         macd_df = calc_macd(close, macd_fast, macd_slow, macd_sig)
 
         in_pos, ep, ed, qty_, peak_p, atr_e = False, 0.0, None, 0, 0.0, 0.0
+        sym_equity = cash   # compounds via realized net_pnl when compound=True
 
         for i in range(lookback, len(dy) - 1):
             if not in_pos:
@@ -930,7 +942,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                 if pd.isna(next_open) or float(next_open) <= 0:
                     continue
 
-                qty_ = int((cash * leverage) // float(next_open))
+                alloc = sym_equity if compound else cash
+                qty_ = int((alloc * leverage) // float(next_open))
                 if qty_ <= 0:
                     continue
 
@@ -1009,6 +1022,8 @@ def run_screener_backtest(stock_dict, rsi_period, rsi_level, wr_period, wr_level
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
+                if compound:
+                    sym_equity += np_
                 in_pos, ep, ed, qty_, peak_p, atr_e = False, 0.0, None, 0, 0.0, 0.0
 
         if in_pos:
@@ -1057,7 +1072,7 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
                       exit_trigger="crossover",
                       target_pct=0.0, stop_loss_pct=0.0, trailing_stop_pct=0.0,
                       max_hold_days=0,
-                      collect_signals=False):
+                      collect_signals=False, compound=False):
     trades, failed = [], []
     signals = []   # every week Stage 1 + Stage 2 both confirm, whether or
                     # not a trade was actually taken that week (audit log)
@@ -1106,6 +1121,7 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
             continue
 
         in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
+        sym_equity = cash   # compounds via realized net_pnl when compound=True
 
         for i in range(lookback, len(wk_raw) - 1):
             w_date = wk_raw.index[i]
@@ -1153,7 +1169,8 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
                 if pd.isna(next_open) or float(next_open) <= 0:
                     continue
 
-                qty_ = int((cash * leverage) // float(next_open))
+                alloc = sym_equity if compound else cash
+                qty_ = int((alloc * leverage) // float(next_open))
                 if qty_ <= 0:
                     continue
 
@@ -1210,6 +1227,8 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
                     return_pct=round(np_ / cash_used * 100, 2),
                     status="CLOSED",
                 ))
+                if compound:
+                    sym_equity += np_
                 in_pos, ep, ed, qty_, peak_p = False, 0.0, None, 0, 0.0
 
         if in_pos:
@@ -1700,13 +1719,23 @@ def config_panel(key_prefix: str, universe: dict,
             target = st.number_input("Target exit (%)", value=3.5,
                                       min_value=0.5, max_value=50.0, step=0.5,
                                       key=f"{key_prefix}_target") / 100
+        compound = st.checkbox(
+            "Compound (reinvest profits into position size)",
+            value=False, key=f"{key_prefix}_compound",
+            help="Off (default): every trade risks the same fixed "
+                 "'Cash per symbol' regardless of prior profit — this "
+                 "is why CAGR/Sharpe can look low even with a solid "
+                 "win rate over a long backtest. On: each symbol's own "
+                 "realized profit grows its own next position size, "
+                 "showing what reinvesting would actually look like.",
+        )
 
     run = st.button("🚀 Run Backtest", type="primary",
                     use_container_width=True, key=f"{key_prefix}_run")
 
     return (selected, int(fast), int(slow), int(signal),
             cash, int(leverage), rate, target, run,
-            pd.Timestamp(start_date), pd.Timestamp(end_date))
+            pd.Timestamp(start_date), pd.Timestamp(end_date), compound)
 
 # ─────────────────────────────────────────────────────────────
 # ENTRY / EXIT CRITERIA PANEL  (shared UI component)
@@ -1844,7 +1873,7 @@ with tab1:
     with st.expander("⚙️ Configure & Run", expanded=True):
         (e_syms, e_fast, e_slow, e_sig,
          e_cash, e_lev, e_rate, _, e_run,
-         e_start, e_end) = config_panel(
+         e_start, e_end, e_compound) = config_panel(
             "etf", ALL_ETFS, 12, 24, 3, has_target=False
         )
 
@@ -1868,6 +1897,7 @@ with tab1:
                 tdf, failed = run_etf_backtest(
                     sel_etfs, e_fast, e_slow, e_sig, e_cash, e_lev, e_rate,
                     start_date=e_start, end_date=e_end,
+                    compound=e_compound,
                     **e_rules,
                 )
 
@@ -1986,7 +2016,7 @@ with tab2:
     with st.expander("⚙️ Configure & Run", expanded=True):
         (n_syms, n_fast, n_slow, n_sig,
          n_cash, n_lev, n_rate, n_target, n_run,
-         n_start, n_end) = config_panel(
+         n_start, n_end, n_compound) = config_panel(
             "n100", NIFTY100_STOCKS, 12, 24, 3, has_target=True
         )
 
@@ -2017,6 +2047,7 @@ with tab2:
                     sel_stocks, n_fast, n_slow, n_sig,
                     n_cash, n_lev, n_rate, n_target,
                     start_date=n_start, end_date=n_end,
+                    compound=n_compound,
                     **n_rules,
                 )
 
@@ -2188,6 +2219,15 @@ with tab3:
             s_rate = st.number_input("MTF rate (% p.a.)", value=14.0,
                                      min_value=0.0, max_value=30.0, step=0.5,
                                      key="scr_rate") / 100
+            s_compound = st.checkbox(
+                "Compound (reinvest profits into position size)",
+                value=False, key="scr_compound",
+                help="Off (default): every trade risks the same fixed "
+                     "'Cash per symbol' regardless of prior profit. On: "
+                     "each symbol's own realized profit grows its own "
+                     "next position size — shows what reinvesting would "
+                     "actually look like instead of a flat-stake CAGR.",
+            )
 
         s_run = st.button("🚀 Run Backtest", type="primary",
                           use_container_width=True, key="scr_run")
@@ -2335,6 +2375,7 @@ with tab3:
                     atr_trail_mult=atr_trail_mult,
                     use_macd_exit=use_macd_exit, macd_fast=int(macd_fast),
                     macd_slow=int(macd_slow), macd_sig=int(macd_sig),
+                    compound=s_compound,
                 )
 
             if tdf.empty:
@@ -2507,6 +2548,16 @@ with tab4:
             n2_rate = st.number_input("MTF rate (% p.a.)", value=14.0,
                                       min_value=0.0, max_value=30.0, step=0.5,
                                       key="n2_rate") / 100
+            n2_compound = st.checkbox(
+                "Compound (reinvest profits into position size)",
+                value=False, key="n2_compound",
+                help="Off (default): every trade risks the same fixed "
+                     "'Cash per symbol' regardless of prior profit — "
+                     "this is why CAGR/Sharpe can look low even with a "
+                     "solid win rate over a multi-year backtest. On: "
+                     "each symbol's own realized profit grows its own "
+                     "next position size.",
+            )
 
         n2_run = st.button("🚀 Run Backtest", type="primary",
                            use_container_width=True, key="n2_run")
@@ -2573,7 +2624,7 @@ with tab4:
                     exit_trigger=n2_exit_trig,
                     target_pct=n2_target, stop_loss_pct=n2_stop,
                     trailing_stop_pct=n2_trail, max_hold_days=int(n2_maxhold),
-                    collect_signals=n2_log_signals,
+                    collect_signals=n2_log_signals, compound=n2_compound,
                 )
 
             if n2_log_signals:
