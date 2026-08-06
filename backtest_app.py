@@ -1244,6 +1244,27 @@ def run_n200_backtest(stock_dict, cash, leverage, rate,
 N200_CREDS_PATH  = r'/Users/gagankumarchavan/Documents/API Cred/noble-aquifer-437514-k4-a50658fe7247.json'
 N200_SHEET_NAME  = "Momentum Watch list - Harish"
 N200_SIGNAL_TAB  = "N200 Backtest Signals"
+N200_TRADES_TAB  = "N200 Backtest Trades"
+
+
+def _open_n200_sheet(tab_name: str, cols: int = 10):
+    scope = ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/drive"]
+    creds  = Credentials.from_service_account_file(N200_CREDS_PATH, scopes=scope)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open(N200_SHEET_NAME)
+
+    existing_ws = [ws.title for ws in spreadsheet.worksheets()]
+    if tab_name not in existing_ws:
+        spreadsheet.add_worksheet(title=tab_name, rows=200, cols=cols)
+    return spreadsheet.worksheet(tab_name)
+
+
+def _append_with_header(sheet, header: list, rows: list, chunk: int = 500):
+    if sheet.row_values(1) != header:
+        sheet.update(range_name="A1", values=[header])
+    for i in range(0, len(rows), chunk):
+        sheet.append_rows(rows[i:i + chunk], value_input_option="USER_ENTERED")
 
 
 def log_signals_to_sheet(signals: list):
@@ -1252,31 +1273,36 @@ def log_signals_to_sheet(signals: list):
     if not signals:
         return 0, None
     try:
-        scope = ["https://spreadsheets.google.com/feeds",
-                 "https://www.googleapis.com/auth/drive"]
-        creds  = Credentials.from_service_account_file(N200_CREDS_PATH, scopes=scope)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open(N200_SHEET_NAME)
-
-        existing_ws = [ws.title for ws in spreadsheet.worksheets()]
-        if N200_SIGNAL_TAB not in existing_ws:
-            spreadsheet.add_worksheet(title=N200_SIGNAL_TAB, rows=200, cols=10)
-        sheet = spreadsheet.worksheet(N200_SIGNAL_TAB)
-
+        sheet = _open_n200_sheet(N200_SIGNAL_TAB)
         header = ["Symbol", "Week", "Monthly MACD", "Monthly Signal",
                   "Monthly ROC", "% from ATH", "Weekly MACD", "Weekly Signal"]
-        if sheet.row_values(1) != header:
-            sheet.update(range_name="A1", values=[header])
-
         rows = [[
             s["symbol"], s["week"].date().isoformat(), s["monthly_macd"],
             s["monthly_signal"], s["monthly_roc"], s["pct_from_ath"],
             s["weekly_macd"], s["weekly_signal"],
         ] for s in signals]
+        _append_with_header(sheet, header, rows)
+        return len(rows), None
+    except Exception as e:
+        return 0, str(e)
 
-        chunk = 500
-        for i in range(0, len(rows), chunk):
-            sheet.append_rows(rows[i:i + chunk], value_input_option="USER_ENTERED")
+
+def log_trades_to_sheet(trades_df: pd.DataFrame):
+    """Append every actual trade (entry/exit date & price, days held,
+    absolute P&L, return %) from a backtest run to a dedicated tab.
+    Returns (rows_written, error_message)."""
+    if trades_df.empty:
+        return 0, None
+    try:
+        sheet = _open_n200_sheet(N200_TRADES_TAB, cols=10)
+        header = ["Symbol", "Entry Date", "Entry Price", "Exit Date", "Exit Price",
+                  "Days Held", "Net P&L (₹)", "Return %", "Exit Reason"]
+        rows = [[
+            r["symbol"], r["entry_date"].date().isoformat(), r["entry_price"],
+            r["exit_date"].date().isoformat(), r["exit_price"], r["holding_days"],
+            r["net_pnl"], r["return_pct"], r["exit_reason"],
+        ] for _, r in trades_df.iterrows()]
+        _append_with_header(sheet, header, rows)
         return len(rows), None
     except Exception as e:
         return 0, str(e)
@@ -2448,6 +2474,14 @@ with tab4:
                      "'Momentum Watch list - Harish' spreadsheet — an "
                      "audit trail independent of the trade log below.",
             )
+            n2_log_trades = st.checkbox(
+                "Log actual trades (entry/exit/P&L) to Google Sheets",
+                value=False, key="n2_log_trades",
+                help="Writes every trade actually taken — entry date & "
+                     "price, exit date & price, days held, net P&L (₹), "
+                     "return % and exit reason — to the 'N200 Backtest "
+                     "Trades' tab in the same spreadsheet.",
+            )
 
         with n2c3:
             n2_cash = st.number_input("Cash per symbol (₹)", value=10000, step=1000,
@@ -2546,6 +2580,17 @@ with tab4:
                 st.error("No trades generated. Try adjusting thresholds, exit rules, "
                          "or the date range.")
             else:
+                if n2_log_trades:
+                    with st.spinner(f"Writing {len(tdf)} trade(s) to Google Sheets..."):
+                        n_written, sheet_err = log_trades_to_sheet(tdf)
+                    if sheet_err:
+                        st.warning(f"⚠️ Could not write trade log to Google Sheets: {sheet_err}")
+                    elif n_written:
+                        st.success(
+                            f"📤 Logged {n_written} trade(s) to "
+                            f"'{N200_TRADES_TAB}' in '{N200_SHEET_NAME}'."
+                        )
+
                 equity  = build_equity_curve(tdf, total_cap)
                 metrics = compute_metrics(tdf, equity, total_cap)
                 st.session_state["n200_results"] = dict(
