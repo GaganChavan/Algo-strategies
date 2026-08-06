@@ -1292,11 +1292,28 @@ def _open_n200_sheet(tab_name: str, cols: int = 10):
     return spreadsheet.worksheet(tab_name)
 
 
-def _append_with_header(sheet, header: list, rows: list, chunk: int = 500):
+def _append_with_header(sheet, header: list, rows: list, chunk: int = 2000):
+    """Batch-append rows in large chunks (fewer API calls = both faster
+    and easier on Sheets' write-requests-per-minute quota), with a small
+    pause between chunks and retry-with-backoff specifically on 429/quota
+    errors so a transient rate limit doesn't kill the whole write."""
     if sheet.row_values(1) != header:
         sheet.update(range_name="A1", values=[header])
+
     for i in range(0, len(rows), chunk):
-        sheet.append_rows(rows[i:i + chunk], value_input_option="USER_ENTERED")
+        batch = rows[i:i + chunk]
+        for attempt in range(4):
+            try:
+                sheet.append_rows(batch, value_input_option="USER_ENTERED")
+                break
+            except Exception as e:
+                is_quota_error = "429" in str(e) or "Quota exceeded" in str(e)
+                if is_quota_error and attempt < 3:
+                    time.sleep(10 * (attempt + 1))   # 10s, 20s, 30s backoff
+                else:
+                    raise
+        if i + chunk < len(rows):
+            time.sleep(2)   # defensive pause between chunks
 
 
 def log_signals_to_sheet(signals: list):
